@@ -70,6 +70,26 @@ where `N` = non-embedding parameters, `D` = training tokens. The 6 comes from
 backward w.r.t. weights). Every architectural or data decision is really a
 question of *how to spend a fixed C*.
 
+**Worked example — where the 6 comes from, and what it costs.** Take one linear
+layer `y = x·W` with `W` of shape `d × d`, so `d²` parameters. For one token:
+
+- forward: `d²` multiply-accumulates = `2d²` FLOPs
+- backward w.r.t. the input (`∂L/∂x = ∂L/∂y · Wᵀ`): another `2d²`
+- backward w.r.t. the weights (`∂L/∂W = xᵀ · ∂L/∂y`): another `2d²`
+
+That is `6d²` = 6 × (its parameters) per token. A transformer is almost entirely
+such matmuls, so summed over the model it is `6N` per token and `6ND` per run.
+Now scale it to Llama-3-8B, trained on 15T tokens:
+
+```
+C = 6 × 8e9 × 15e12              = 7.2e23 FLOPs
+one H100 at 40% MFU              = 0.4 × 989e12 ≈ 4.0e14 FLOP/s
+C / 4.0e14                       ≈ 1.8e9 GPU-seconds ≈ 21,000 H100-days
+```
+
+About two weeks on a 1,500-GPU cluster. Checkpoint 1 below asks you to do the
+same for a different model — do it without looking back here.
+
 **3. Loss is predictable.** Loss vs. compute follows a power law across ~6 orders
 of magnitude. A *sweep* of small models, trained with one consistent recipe, lets
 you forecast the loss of a run far larger than any of them. The forecast is
@@ -88,38 +108,24 @@ over thousands of GPUs for months — wearing a machine learning costume.
 
 ### The pipeline, end to end
 
+```mermaid
+flowchart TD
+    A["Raw web dumps<br/>petabytes of HTML"] -->|"extract text,<br/>language ID"| B["Quality filtering<br/>heuristics + learned classifiers"]
+    B --> C["Deduplication<br/>MinHash LSH, exact substring"]
+    C --> D["Decontamination<br/>remove eval-set overlap"]
+    D --> E["Mixing<br/>web / code / math / books, with weights"]
+    E --> F["Tokenization<br/>BPE → uint16/uint32 token shards"]
+    F --> G
+    subgraph G["Training loop — repeated ~10⁵–10⁶ times"]
+        direction LR
+        G1["sample<br/>batch"] --> G2["forward<br/>→ loss"] --> G3["backward"] --> G4["all-reduce<br/>gradients"] --> G5["optimizer<br/>step"] --> G6["checkpoint<br/>(periodically)"]
+    end
+    G --> H["Anneal / midtrain<br/>on high-quality data"]
+    H --> I["Base model"] --> J["Evals"] --> K["Post-training"]
 ```
- raw web dumps (petabytes)
-        │  extract text, language ID
-        ▼
- quality filtering  ──► heuristics + learned classifiers
-        │
-        ▼
- deduplication      ──► MinHash LSH, exact substring
-        │
-        ▼
- decontamination    ──► remove eval-set overlap
-        │
-        ▼
- mixing             ──► web / code / math / books, with weights
-        │
-        ▼
- tokenization       ──► BPE → uint16/uint32 token shards
-        │
-        ▼
- ┌──────────────────────────────────────┐
- │  TRAINING LOOP                       │
- │  sample batch → forward → loss       │
- │  → backward → all-reduce → optimizer │
- │  → checkpoint  (repeat ~10⁵–10⁶ ×)   │
- └──────────────────────────────────────┘
-        │
-        ▼
- anneal / midtrain on high-quality data
-        │
-        ▼
- base model ──► evals ──► post-training
-```
+
+Parts 3–4 cover everything above the training loop, Parts 5–10 the loop itself,
+Part 11 the evals and Part 13 what comes after.
 
 ### Checkpoint 1
 
@@ -146,6 +152,21 @@ Don't over-invest here. You need working fluency, not mastery.
 **The one derivation worth doing by hand:** cross-entropy loss of a softmax
 output. The gradient w.r.t. the logits is `softmax(z) − y_onehot`. It falls out
 in three lines and it explains why training is numerically well-behaved.
+
+**Worked example — one softmax, by hand.** A three-token vocabulary, logits
+`z = [2, 1, 0]`, and the correct next token is token 0:
+
+```
+exp(z)             = [7.389, 2.718, 1.000]        sum = 11.107
+p = softmax(z)     = [0.665, 0.245, 0.090]
+loss = −ln p[0]    = −ln 0.665 = 0.408 nats
+∂loss/∂z = p − y   = [0.665 − 1, 0.245, 0.090] = [−0.335, 0.245, 0.090]
+```
+
+Read the gradient as an instruction: push the correct logit up, and push each
+wrong logit down in proportion to the probability it took. The components sum to
+zero and each stays within `[−1, 1]` however extreme the logits get — that
+boundedness is the "numerically well-behaved" part.
 
 **Fastest path if rusty:** Karpathy's *Neural Networks: Zero to Hero* videos 1–4
 (micrograd → makemore → attention). ~8 hours, and you write every line.
@@ -214,6 +235,27 @@ Two levels:
 - **Exact, substring-level:** suffix-array based removal of repeated spans over
   ~50 tokens. Catches boilerplate that survives doc-level dedup.
 
+**Worked example — what banding actually catches.** Split a MinHash signature
+into `b` bands of `r` rows. Two documents with Jaccard similarity `s` match on one
+band with probability `sʳ`, so they collide in *at least one* band — and become a
+candidate pair — with probability `1 − (1 − sʳ)ᵇ`. For `b = 16, r = 8` (128
+permutations, as in the Stage 4 notebook cell):
+
+| Jaccard `s` | P(candidate pair) |
+|---|---|
+| 0.5 | 6% |
+| 0.6 | 24% |
+| 0.7 | 61% |
+| 0.8 | 95% |
+| 0.9 | ~100% |
+
+That S-curve is the whole trick: near-duplicates almost always collide, unrelated
+documents almost never do, and you never compare all pairs. The quick formula
+`(1/b)^(1/r) ≈ 0.71` marks where the curve is *steepest* — a pair at exactly that
+similarity is caught ~64% of the time; the 50% point is ~0.67. More bands with
+fewer rows each shift the curve left: more duplicates caught, but more false
+candidates to verify.
+
 Also decide *scope*: dedup within a crawl dump, or globally across all dumps?
 FineWeb found per-dump dedup outperformed global dedup — over-deduplication
 strips away genuinely useful repeated content (e.g. widely-mirrored reference
@@ -280,6 +322,24 @@ An underrated source of model pathologies.
 the most frequent adjacent pair; stop at a target vocabulary size. Byte-level BPE
 (GPT-2 onward) guarantees no out-of-vocabulary input.
 
+**Worked example — four BPE merges.** A toy corpus of word counts:
+`low ×5, lower ×2, newest ×6, widest ×3`. Start from single characters and count
+adjacent pairs, weighting each by how often its word occurs:
+
+| Step | Most frequent pair | Count | Where it comes from | New token |
+|---|---|---|---|---|
+| 1 | `e` `s` | 9 | newest (6) + widest (3) | `es` |
+| 2 | `es` `t` | 9 | the same two words | `est` |
+| 3 | `l` `o` | 7 | low (5) + lower (2) | `lo` |
+| 4 | `lo` `w` | 7 | the same two words | `low` |
+
+(Steps 1 and 3 had ties — `s t` also scored 9, `o w` also 7. Tie-breaking is an
+implementation detail.) After four merges, `newest` is `n e w est` — 4 tokens
+instead of 6 — and `low` is a single token. A real tokenizer repeats this tens of
+thousands of times, starting from bytes; the ordered list of merges *is* the
+tokenizer. Words it never merged simply stay split into smaller pieces, which is
+why nothing is ever out of vocabulary.
+
 Key decisions:
 
 | Decision | Typical | Why it matters |
@@ -325,18 +385,31 @@ the history.
 
 ### 5.1 The block
 
-```
-x ─┬─────────────────────────────────────┐
-   │                                     │
-   ├─► RMSNorm ─► Attention (RoPE, GQA) ─┴─► + ─┬───────────────────┐
-                                                │                   │
-                                                ├─► RMSNorm ─► MLP ─┴─► +  ─► x'
-                                                              (SwiGLU)
+```mermaid
+flowchart LR
+    X["x"] --> N1["RMSNorm"] --> AT["Attention<br/>RoPE, GQA"] --> P1(("+"))
+    X -->|"residual"| P1
+    P1 --> N2["RMSNorm"] --> M["MLP<br/>SwiGLU"] --> P2(("+"))
+    P1 -->|"residual"| P2
+    P2 --> Y["x′"]
 ```
 
 Pre-norm (normalize *before* the sublayer, not after) with residual connections.
 This is what makes deep stacks trainable — the residual stream is an
-uninterrupted identity path from input to output.
+uninterrupted identity path from input to output. Each block only *adds* a
+correction to that stream; nothing overwrites it.
+
+The whole model is just that block stacked `L` times between an embedding and an
+output projection:
+
+```mermaid
+flowchart TD
+    T["token ids — shape (B, T)"] --> E["Embedding table (V × d)"]
+    E --> B1["Block 1"] --> B2["Block 2"] --> BD["…"] --> BL["Block L"]
+    BL --> NF["Final RMSNorm"]
+    NF --> H["LM head (d × V)<br/>often the embedding table, transposed (tied)"]
+    H --> LG["logits — shape (B, T, V)"] --> CE["cross-entropy against the<br/>next token at every position"]
+```
 
 ### 5.2 Attention
 
@@ -362,6 +435,43 @@ Variants, in the order they were adopted:
 
 The KV cache is an *inference* concern, but it constrains *pretraining*
 architecture choices, because you must serve what you train.
+
+GQA in a picture — 8 query heads sharing 2 key/value heads, 4 to a group:
+
+```mermaid
+flowchart LR
+    q1["q head 1"] --> kv1["K/V head 1"]
+    q2["q head 2"] --> kv1
+    q3["q head 3"] --> kv1
+    q4["q head 4"] --> kv1
+    q5["q head 5"] --> kv2["K/V head 2"]
+    q6["q head 6"] --> kv2
+    q7["q head 7"] --> kv2
+    q8["q head 8"] --> kv2
+```
+
+MHA is the case where every query head has its own K/V head; MQA is the case
+where all eight share one.
+
+**Worked example — tensor shapes through one attention layer.** The notebook's
+`small` preset: batch `B = 24`, sequence `T = 512`, `d_model = 512`, 8 query
+heads, 2 KV heads, so `d_head = 512 / 8 = 64`.
+
+```
+x                          (24, 512, 512)      B, T, d_model
+q = x·W_q, split heads     (24, 8, 512, 64)    B, heads, T, d_head
+k = x·W_k,  v = x·W_v      (24, 2, 512, 64)    only 2 KV heads (GQA)
+repeat k, v 4×             (24, 8, 512, 64)    each KV head serves 4 query heads
+scores = q·kᵀ / √64        (24, 8, 512, 512)   one T × T matrix per head
+softmax(scores + M) · v    (24, 8, 512, 64)
+merge heads, · W_o         (24, 512, 512)      back onto the residual stream
+```
+
+Two numbers worth noticing. The score tensor alone is ~50M entries — ~100 MB in
+bf16, *per layer* — and it grows with `T²`. Never building it is exactly what
+FlashAttention does (Part 9.4). And at inference the KV cache costs
+`2 (K and V) × 8 layers × 2 heads × 64 × 2 bytes = 4 KB` per token; with full MHA
+(8 KV heads) it would be 16 KB. That 4× is the whole reason GQA exists.
 
 **Positional information.** Vanilla transformers add position embeddings.
 Current practice:
@@ -446,6 +556,22 @@ With `d_ff ≈ (8/3)·d_model` the MLP term is `≈ 8·d²`. Embeddings (`V·d_m
 twice if untied) are excluded by convention, as in [Part 1](#1-the-mental-model).
 Still, compute it programmatically — hand formulas drift with architecture.
 
+**Worked example — the notebook's `small` model.** `d_model = 512`, 8 layers,
+8 query heads and 2 KV heads, and `d_ff = 1408` (`8/3 × 512 = 1365`, rounded up
+to a multiple of 128):
+
+```
+attention   (2 + 2·2/8) · 512²    =    655,360
+MLP         3 · 512 · 1408        =  2,162,688
+per layer                         =  2,818,048
+× 8 layers                        = 22.54M   non-embedding parameters
+embedding   16,000 · 512          =  8.19M   (tied, so counted once)
+```
+
+The MLP is ~77% of every layer. That is typical of dense LLMs, and it is why
+Mixture-of-Experts (5.5) targets the MLP rather than attention. The RMSNorm gains
+add ~10K more — negligible.
+
 ### Checkpoint 5
 
 Implement a decoder-only transformer from scratch in a single file: RMSNorm,
@@ -485,6 +611,22 @@ prefix, never on its own samples. This creates train/inference mismatch
 > identical. A bigger vocabulary packs more text into each token, so per-token
 > loss is mechanically higher even when the model is equally good or better on
 > the same underlying text. BPB removes that artifact.
+
+**Worked example — the same loss in three units.** A model with a 16,000-token
+vocabulary reaches 1.5 nats/token on validation text that averages 4.2 bytes per
+token:
+
+```
+uniform-guessing baseline   ln 16000              = 9.68 nats/token
+perplexity                  exp(1.5)              = 4.48
+bits per byte               1.5 / (ln 2 × 4.2)    = 0.515
+```
+
+Perplexity 4.48 means that on average the model is as unsure as if it were
+choosing uniformly among ~4.5 tokens — down from 16,000 at initialization. Now a
+second model with a 32k vocabulary averages 5 bytes/token and reports a *higher*
+1.7 nats/token. Its BPB is `1.7 / (ln 2 × 5) = 0.49` — it is actually the better
+model. Raw loss would have ranked them the wrong way round.
 
 **Interpreting the curve.** A healthy run drops very fast for the first ~1% of
 steps (learning unigram frequencies), then settles into a near-straight line on a
@@ -560,6 +702,23 @@ lr │      ┌─────────────────────�
        warmup        stable            decay
 ```
 
+**Worked example — the notebook's schedule.** The `small` preset uses
+`max_steps = 6000`, `warmup_frac = 0.02`, `decay_frac = 0.20`, a peak of `6e-4`
+and a floor of 10% of peak:
+
+| Step | Phase | LR |
+|---|---|---|
+| 0 | warmup begins (1/120 of peak) | 5.0e-6 |
+| 60 | warmup, halfway | 3.05e-4 |
+| 120 – 4,799 | stable | 6.0e-4 |
+| 5,400 | decay, halfway | 3.3e-4 |
+| 5,999 | decay ends | ≈ 6.0e-5 |
+
+Nearly 80% of training happens at a single learning rate. If you decided at step 3,000
+to stop early, you would branch from a stable-phase checkpoint and run a short
+decay from there — you'd still get a finished model. With cosine, the LR at step
+3,000 already depends on having planned for 6,000.
+
 ### 7.3 Batch size
 
 Measured in **tokens per optimizer step**, not sequences. Typical: 0.5M–4M
@@ -603,6 +762,33 @@ optimizer.step(); optimizer.zero_grad(set_to_none=True)
 
 With DDP, disable gradient sync on all but the last micro-step
 (`model.no_sync()`) or you pay `accum_steps`× the communication.
+
+One full optimizer step, drawn out:
+
+```mermaid
+flowchart TD
+    S["start of step:<br/>gradients are zero"] --> MB["micro-batch i:<br/>forward → loss / accum_steps → backward<br/>(gradients add up in .grad)"]
+    MB -->|"more micro-batches"| MB
+    MB -->|"last micro-batch done"| AR["all-reduce gradients across GPUs<br/>(DDP — once, on the last micro-step)"]
+    AR --> CL["clip global gradient norm to 1.0"]
+    CL --> OP["optimizer.step()<br/>with this step's LR from the schedule"]
+    OP --> Z["zero_grad()"]
+    Z --> S
+```
+
+**Worked example — sizing gradient accumulation.** You want 0.5M tokens per step
+(`524,288 = 2¹⁹`) at `seq_len = 1024`, and one GPU fits 16 sequences:
+
+```
+tokens per micro-batch   16 × 1024              = 16,384
+micro-steps needed       524,288 / 16,384        = 32
+on 4 GPUs with DDP       32 / 4                  = 8 micro-steps per GPU
+```
+
+Each GPU divides its loss by 8 — its *own* micro-step count — and DDP's
+all-reduce averages across the 4 GPUs. The optimizer sees exactly the gradient of
+one 0.5M-token batch, whether it was computed on 1 GPU in 32 pieces or on 4 GPUs
+in 8.
 
 ### 7.4 Initialization
 
@@ -663,6 +849,29 @@ with.
 This corrected the earlier Kaplan-era practice of training large models on too
 few tokens. GPT-3 is the canonical example: 175B parameters on 300B tokens, which
 is ~1.7 tokens per parameter — more than 10× under-trained by this criterion.
+
+**Worked example — spending a fixed budget.** Say you have `C = 10²¹` FLOPs. With
+the rule of thumb `D = 20N`, `C = 6N · 20N = 120N²`, so `N = √(10²¹ / 120) ≈ 2.9B`
+parameters trained on `D ≈ 58B` tokens.
+
+Now check the rule against the fitted law from 8.1, using Chinchilla's published
+constants (`E = 1.69, A = 406.4, B = 410.7, α = 0.34, β = 0.28`). Hold `C` fixed and
+move `N`; `D` is whatever the budget leaves:
+
+| N | D = C / 6N | tokens/param | predicted loss |
+|---|---|---|---|
+| 0.5B | 333B | 667 | 2.382 |
+| 1.0B | 167B | 167 | 2.340 |
+| 1.8B | 91B | 50 | **2.329** (minimum) |
+| 3.0B | 56B | 19 | 2.336 |
+| 10B | 17B | 1.7 | 2.416 |
+
+Two lessons. First, the bowl is *flat*: everything from 1B to 3B lands within
+~0.01 nats of the optimum. That flatness is why training a smaller model on far
+more tokens (8.3) costs so little in loss. Second, this particular fit puts the
+optimum near 50 tokens/param, not 20 — Chinchilla's own three estimation methods
+disagreed, and later refits disagree again. That is exactly why 20 is a rule of
+thumb. The last row is GPT-3's ratio: clearly off the bottom of the bowl.
 
 ### 8.3 Why most modern models train past Chinchilla-optimal
 
@@ -750,7 +959,31 @@ scaling; treat it as advanced.
 
 Real frontier runs combine 4–5 of these ("5D parallelism"). The standard layout
 is TP within a node, PP across a small group of nodes, DP/FSDP across everything
-else.
+else. For a model split into two pipeline stages, that looks like this:
+
+```mermaid
+flowchart LR
+    subgraph R1["Data-parallel replica 1 — one full copy of the model"]
+        direction TB
+        subgraph N1["Node 1 — pipeline stage 1 (first half of the layers)"]
+            direction LR
+            a0["GPU 0"] --- a1["GPU 1"] --- a2["…"] --- a7["GPU 7"]
+        end
+        subgraph N2["Node 2 — pipeline stage 2 (second half)"]
+            direction LR
+            b0["GPU 0"] --- b1["GPU 1"] --- b2["…"] --- b7["GPU 7"]
+        end
+        N1 -->|"PP: activations forward,<br/>gradients backward"| N2
+    end
+    subgraph R2["Data-parallel replica 2 — same layout on 2 more nodes"]
+        c0["nodes 3 and 4"]
+    end
+    R1 <-->|"DP / FSDP: all-reduce or<br/>reduce-scatter + all-gather"| R2
+```
+
+Inside each node, the 8 GPUs split every weight matrix between them (TP, over
+NVLink). The lines between GPUs are that TP group; the arrows are the slower
+links between nodes.
 
 **ZeRO stages**, worth knowing precisely:
 - Stage 1: shard optimizer states across the data-parallel ranks. Optimizer
@@ -762,6 +995,22 @@ else.
 - Stage 3 (≈ FSDP's full-shard mode): also shard parameters; gather them
   just-in-time per layer. Maximum savings, most communication. (FSDP also has
   a mode that shards only gradients and optimizer states — roughly Stage 2.)
+
+**Worked example — a 7B model on one 8-GPU node.** Take the 18-byte budget from
+9.1 apart: 2 bytes of bf16 weights, 4 of fp32 gradients, and 12 of optimizer
+state (fp32 master copy + Adam `m` + Adam `v`). With 8 data-parallel GPUs, here
+is what *each* GPU holds:
+
+| Scheme | Split 8 ways | Bytes/param per GPU | Per GPU, 7B model |
+|---|---|---|---|
+| DDP | nothing | 18 | 126 GB |
+| ZeRO-1 | optimizer state (12) | 2 + 4 + 12/8 = 7.5 | 52.5 GB |
+| ZeRO-2 | + gradients (4) | 2 + (4 + 12)/8 = 4 | 28 GB |
+| ZeRO-3 / FSDP | + weights (2) | 18/8 = 2.25 | 15.8 GB |
+
+On 80 GB GPUs, plain DDP doesn't fit at all. ZeRO-1 fits with ~27 GB left for
+activations; ZeRO-3 leaves ~64 GB. Each stage buys memory with communication:
+ZeRO-3 has to all-gather every layer's weights before using them.
 
 ### 9.4 Making it fast
 
@@ -796,6 +1045,22 @@ This makes published MFU numbers only loosely comparable: some use bare `6N`,
 PaLM's original definition adds the attention term, and some count the LM head.
 When you compare against a paper, use *its* formula — which is why Stage 11 logs
 both the bare `6N` figure and the fuller estimate.
+
+**Worked example — MFU for the notebook's `small` run on an A100.** Say the log
+shows 300k tokens/s against the A100's 312 TFLOP/s bf16 peak:
+
+```
+bare 6N         6 × 22.54M                               = 135M FLOPs/token
+fuller          6 × (22.54M + 8.19M LM head)
+                  + 12 × 8 × 512 × 512 (attention)       = 210M FLOPs/token
+
+MFU (6N)        135M × 300k / 312e12                     = 13%
+MFU (fuller)    210M × 300k / 312e12                     = 20%
+```
+
+Same run, same speed: 13% or 20%, depending on what you count. At this size the
+LM head and attention are over a third of the real work. On a 70B model at 4k
+context the two figures differ by under 10%.
 
 **On large, well-shaped training workloads, 35–55% is good.** Below ~25% on such
 a workload usually means a fixable problem — dataloading, missing overlap,
@@ -912,6 +1177,19 @@ harnesses make different choices, which is why "the same model" scores different
 across leaderboards. Use a single harness (`lm-evaluation-harness` is standard)
 and report its settings.
 
+**Worked example — the normalization choice decides the answer.** Prompt: *"The
+capital of France is"*. Illustrative scores for two options:
+
+| Option | Tokens | Total log-prob | Per-token log-prob |
+|---|---|---|---|
+| `" Paris"` | 1 | −1.2 | −1.2 |
+| `" the city of Paris"` | 4 | −3.2 | −0.8 |
+
+Rank by total log-prob and `" Paris"` wins; rank by per-token average and the
+long option wins. Both options are "correct" here, but in a multiple-choice
+benchmark only one is — so the same model scores differently under two harness
+settings without a single weight changing.
+
 ### 11.3 Traps
 
 - **Contamination.** Re-check after every data change, not once.
@@ -995,6 +1273,15 @@ learning is front-loaded into the cheap rungs.
 ## 13. After pretraining
 
 Where the boundary is, so you know what pretraining is *not* responsible for.
+
+```mermaid
+flowchart LR
+    PT["Pretraining<br/>trillions of tokens, web-heavy mix<br/>warmup + stable LR"] --> MT["Midtraining / anneal<br/>last 10–20% of tokens<br/>high-quality mix, LR decays"]
+    MT --> LC["Long-context extension<br/>raise RoPE θ, a few B<br/>long-document tokens"]
+    LC --> BASE["Base model"]
+    BASE --> PO["Post-training<br/>SFT · preference optimization · RL"]
+    PO --> AS["Assistant model"]
+```
 
 **Midtraining / annealing.** The final 10–20% of tokens, at decaying LR, on a
 much higher-quality mix — textbooks, curated math and code, some
@@ -1254,6 +1541,30 @@ Every stage has the same fields:
 - **Verify** — how you know it worked *before* moving on. Do not skip these; a
   pretraining bug found three stages late costs hours.
 - **Breaks like this** — the failure signatures specific to this stage.
+
+**How the stages connect.** Each stage produces something the next one consumes.
+Keep this map in mind — when a stage fails, the bug is either in that stage or in
+an artifact upstream of it:
+
+```mermaid
+flowchart TD
+    S1["1 · Config"] -.-> S2["2 · raw documents"]
+    S2 --> S3["3 · filtered documents"] --> S4["4 · deduplicated documents"]
+    S4 --> S5["5 · tokenizer.json"]
+    S4 --> S6["6 · train.bin / val.bin"]
+    S5 --> S6
+    S6 --> S7["7 · Loader: (seed, step) → batch"]
+    S7 --> S9["9 · pre-flight checks"]
+    S8["8 · GPT model"] --> S9
+    S9 --> S11["11 · training loop"]
+    S10["10 · AdamW + WSD schedule"] --> S11
+    S12a["12a · save / load helpers"] --> S11
+    S11 --> CK["checkpoints:<br/>last.pt · stable_end.pt · final.pt"]
+    CK --> S12b["12b · round-trip check"]
+    CK --> S13["13 · evaluate: loss, BPB, samples"]
+    CK --> S14["14 · anneal A/B<br/>both arms branch from stable_end.pt"]
+    S7 --> S15["15 · scaling law<br/>trains 5–6 fresh models"]
+```
 
 ### 16.0 Cell map
 
@@ -1537,7 +1848,7 @@ import hashlib
 
 NUM_PERM, N_GRAM, BANDS = 128, 5, 16
 ROWS      = NUM_PERM // BANDS
-THRESHOLD = (1 / BANDS) ** (1 / ROWS)      # the S-curve midpoint: ~0.71 here
+THRESHOLD = (1 / BANDS) ** (1 / ROWS)      # steepest point of the S-curve: ~0.71
 JACCARD_MIN = 0.7                          # verification cutoff (see below)
 
 rng = np.random.default_rng(cfg.seed)
@@ -1585,10 +1896,12 @@ if dup_of:                       # always eyeball a matched pair
     print(f"DUP:\n{kept[i][:200]}\n\nORIGINAL:\n{kept[j][:200]}")
 ```
 
-**Predict before you run.** With `BANDS=16` and `ROWS=8`, what similarity does
-this catch about half the time? The LSH S-curve midpoint is `(1/BANDS)^(1/ROWS)`
-— compute it before looking. (Raising `BANDS` at fixed `NUM_PERM` *lowers* the
-threshold, catching more but with more false positives.)
+**Predict before you run.** With `BANDS=16` and `ROWS=8`, where is the
+catch-probability curve steepest? That point is `(1/BANDS)^(1/ROWS)` — compute it
+before looking. Then use `1 − (1 − sʳ)ᵇ` from [Part 3.3](#33-deduplication) to find
+how often a pair *at* that similarity gets caught; it is not 50%. (Raising `BANDS`
+at fixed `NUM_PERM` *lowers* the threshold, catching more but with more false
+positives.)
 
 **Verify.** Print a matched pair and confirm they really are near-duplicates. On
 TinyStories expect a few percent; on raw Common Crawl, 30–60% is normal.
