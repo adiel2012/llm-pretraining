@@ -1,5 +1,9 @@
 # LLM Pretraining — A Study Guide
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/adiel2012/llm-pretraining/blob/main/llm-pretraining.ipynb)
+&nbsp;Run [Part 16](#16-the-end-to-end-process--notebook-blueprint) end to end in the
+companion notebook, [`llm-pretraining.ipynb`](llm-pretraining.ipynb).
+
 > Pretraining is the phase where a randomly initialized transformer is trained on
 > trillions of tokens with a single objective: predict the next token. Everything
 > else — instruction tuning, RLHF, tool use — is a thin layer on top of what
@@ -13,7 +17,8 @@ calculus. You do not need prior transformer experience — Part 2 builds it.
 - **The process track — [Part 16](#16-the-end-to-end-process--notebook-blueprint).**
   A linear, runnable walkthrough of the whole pipeline in the order you actually
   execute it, from raw text to a trained, evaluated base model. Every stage is a
-  notebook cell. **This is the spine — start here.**
+  cell in [the Colab notebook](https://colab.research.google.com/github/adiel2012/llm-pretraining/blob/main/llm-pretraining.ipynb).
+  **This is the spine — start here.**
 - **The reference track — Parts 1–15.** Topic-by-topic depth. Each process stage
   links back to the part that explains *why*. Read these when a stage raises a
   question, or read them straight through first if you prefer theory before
