@@ -318,9 +318,10 @@ You have domain buckets and a token budget. Weights matter:
 
 ### 3.6 Practical shape of the data pipeline
 
-Tokenized data is stored as flat binary shards of `uint16` (vocab < 65536) or
-`uint32`, concatenated with a document separator token, then read as a
-memory-mapped array. A batch is `B` random offsets into that array, each of
+Tokenized data is stored as flat binary shards of `uint16` (vocab ≤ 65,536 —
+IDs `0…65535` fit) or `uint32` above that, concatenated with a document
+separator token, then read as a memory-mapped array. A batch is `B` random
+offsets into that array, each of
 length `T+1`; inputs are `[:-1]`, targets are `[1:]`.
 
 ```python
@@ -1769,7 +1770,7 @@ stage runs on CPU at the `tiny` preset — that is what `tiny` is for.
 | 3 | [Inspect and filter](#stage-3--inspect-and-filter) | 1–5 min | no |
 | 4 | [Deduplicate](#stage-4--deduplicate) | 2–10 min | no |
 | 5 | [Train the tokenizer](#stage-5--train-the-tokenizer) | 2–10 min | no |
-| 6 | [Tokenize to shards](#stage-6--tokenize-to-shards) | 5–20 min | no |
+| 6 | [Tokenize to binary](#stage-6--tokenize-to-binary) | 5–20 min | no |
 | 7 | [Dataloader](#stage-7--the-dataloader) | seconds | no |
 | 8 | [Build the model](#stage-8--build-the-model) | seconds | yes |
 | 9 | [Pre-flight sanity checks](#stage-9--pre-flight-sanity-checks) | 1–2 min | yes |
@@ -2184,7 +2185,7 @@ which quietly reintroduces the leakage Stage 4 split to avoid.
 
 ---
 
-### Stage 6 — Tokenize to shards
+### Stage 6 — Tokenize to binary
 
 **Goal.** `train.bin` and `val.bin` — flat token-id arrays, written incrementally.
 
@@ -2193,6 +2194,14 @@ once, up front, into a flat binary file that can be memory-mapped. Documents are
 concatenated with an end-of-text token between them ([Part 3.6](#36-practical-shape-of-the-data-pipeline)).
 `train_docs`/`val_docs` already exist from Stage 4 — this stage only encodes
 them, it does not decide the split.
+
+This produces exactly two monolithic files, not the sharded `train_00000.bin,
+train_00001.bin, ...` layout Part 3.6 describes for real pipelines — one file
+per split is enough at TinyStories scale and keeps the notebook's `Loader`
+simple. `CHUNK` below controls how many documents go into one
+`tok.encode_batch()` call (tokenizer throughput and the progress-bar
+granularity); it has no bearing on memory, since every encoded document is
+written straight to disk rather than held in an array.
 
 ```python
 # Cell 6 — tokenize to flat binary
