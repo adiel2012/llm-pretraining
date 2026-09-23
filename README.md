@@ -3307,7 +3307,7 @@ instinct, which is the skill this stage exists to build.
 the printed token counts really do scale with `N` — if they are all equal, the
 token budget broke and the fit is measuring convergence, not scale. Check the
 `eq.epochs` column too: at 20 tokens/param the 22M model needs ~450M tokens, which
-is 5+ passes over the `small` corpus. If any size warns, raise `n_docs` toward
+is 5+ equivalent token epochs over the `small` corpus. If any size warns, raise `n_docs` toward
 the full TinyStories train split (~2.1M stories) before running this stage —
 otherwise the held-out point is exactly the one damaged by repetition.
 
@@ -3349,7 +3349,7 @@ concept in Parts 1–15 will have a concrete referent by then.
 | Term | Meaning |
 |---|---|
 | **BPB** | Bits per byte. Tokenizer-independent loss measure. |
-| **Chinchilla-optimal** | `D ≈ 20N`; minimizes loss for fixed training compute. |
+| **Chinchilla-optimal** | A compute-optimal balance of model size and training data. `D ≈ 20N` is the commonly cited rule of thumb, not a universal constant (Part 8). |
 | **Critical batch size** | Batch size past which larger batches stop reducing required steps proportionally. |
 | **Decontamination** | Removing eval-set overlap from training data. |
 | **FSDP / ZeRO-3** | Sharding parameters, gradients and optimizer states across data-parallel ranks. |
