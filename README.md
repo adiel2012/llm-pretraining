@@ -5,9 +5,13 @@
 companion notebook, [`llm-pretraining.ipynb`](llm-pretraining.ipynb).
 
 > Pretraining is the phase where a randomly initialized transformer is trained on
-> trillions of tokens with a single objective: predict the next token. Everything
-> else — instruction tuning, RLHF, tool use — is a thin layer on top of what
-> happens here.
+> trillions of tokens. For the decoder-only models this guide covers, the primary
+> objective is simply: predict the next token. Everything else — instruction
+> tuning, RLHF, tool use — builds on what is learned here.
+
+*Scope:* decoder-only causal language models (the GPT / Llama family). Other
+pretraining objectives exist — span corruption (T5), denoising, multimodal
+objectives — and are out of scope.
 
 **Who this is for:** you can write PyTorch and remember basic linear algebra and
 calculus. You do not need prior transformer experience — Part 2 builds it.
@@ -56,8 +60,10 @@ learning; the prose is scaffolding.
 Hold these five facts in your head; most of the field is elaboration on them.
 
 **1. The objective is trivial.** Given tokens `x₁…xₜ`, predict `xₜ₊₁`. Loss is
-cross-entropy, averaged over every position in every sequence. That's it. There
-is no auxiliary trick doing the heavy lifting.
+cross-entropy, averaged over every position in every sequence. Small auxiliary
+terms do appear — z-loss for stability (Part 10), load-balancing losses in MoE
+models (Part 5.5) — but they are guard rails. Next-token prediction does the
+heavy lifting.
 
 **2. Compute is the currency.** A useful approximation for a dense transformer:
 
@@ -77,20 +83,33 @@ layer `y = x·W` with `W` of shape `d × d`, so `d²` parameters. For one token:
 - backward w.r.t. the input (`∂L/∂x = ∂L/∂y · Wᵀ`): another `2d²`
 - backward w.r.t. the weights (`∂L/∂W = xᵀ · ∂L/∂y`): another `2d²`
 
-That is `6d²` = 6 × (its parameters) per token. A transformer is almost entirely
-such matmuls, so summed over the model it is `6N` per token and `6ND` per run.
-Now scale it to Llama-3-8B, trained on 15T tokens:
+That is `6d²` = 6 × (its parameters) per token. Most of a large transformer's
+compute is such matmuls, so summed over the model it is about `6N` per token and
+`6ND` per run.
+
+Treat `6ND` as an approximation for scaling estimates, not an exact FLOP count.
+It leaves out the attention-score matmuls (which grow with sequence length), the
+LM-head projection, the elementwise work (softmax, norms, activations), and any
+recomputation from activation checkpointing. For large models the error is small;
+for small models or long contexts it is not ([Part 9.5](#95-mfu--the-number-that-matters)
+shows by how much).
+
+Now scale it to Llama-3-8B, trained on 15T tokens. Its "8B" includes two
+128,256 × 4,096 embedding tables (input and untied output, ~0.5B each), so by
+this guide's definition `N ≈ 7.0B`:
 
 ```
-C = 6 × 8e9 × 15e12              = 7.2e23 FLOPs
+C = 6 × 7.0e9 × 15e12            ≈ 6.3e23 FLOPs
 one H100 at 40% MFU              = 0.4 × 989e12 ≈ 4.0e14 FLOP/s
-C / 4.0e14                       ≈ 1.8e9 GPU-seconds ≈ 21,000 H100-days
+C / 4.0e14                       ≈ 1.6e9 GPU-seconds ≈ 18,000 H100-days
 ```
 
-About two weeks on a 1,500-GPU cluster. Checkpoint 1 below asks you to do the
-same for a different model — do it without looking back here.
+About 12 days on a 1,500-GPU cluster. (Using the headline 8B gives ~21,000 —
+close enough for a back-of-envelope estimate, but know which convention you're
+using.) Checkpoint 1 below asks you to do the same for a different model — do it
+without looking back here.
 
-**3. Loss is predictable.** Loss vs. compute follows a power law across ~6 orders
+**3. Loss is predictable — empirically.** Loss vs. compute follows a power law across ~6 orders
 of magnitude. A *sweep* of small models, trained with one consistent recipe, lets
 you forecast the loss of a run far larger than any of them. The forecast is
 not a guarantee: the further you extrapolate, the more a change in data, recipe or
@@ -189,10 +208,10 @@ should get 40%.
 
 | Source | Rough scale | Notes |
 |---|---|---|
-| Common Crawl | ~100B pages, petabytes of WARC | The base of nearly every open corpus. ~90%+ gets filtered away. |
+| Common Crawl | ~100B pages, petabytes of WARC | The base of nearly every open corpus. Typically ~90% gets filtered away (RefinedWeb). |
 | Curated web | FineWeb (15T), DCLM-Baseline (4T), RefinedWeb (5T) | Pre-filtered CC derivatives. **Start here** — don't re-do CC processing. |
-| Code | The Stack v2, GitHub | Improves reasoning even on non-code evals. |
-| Math | OpenWebMath, proof corpora, arXiv | Small volume, outsized effect. |
+| Code | The Stack v2, GitHub | Has been reported to improve reasoning even on non-code evals (e.g. *To Code, or Not To Code?*, 2024). |
+| Math | OpenWebMath, proof corpora, arXiv | Small volume, large measured effect on math benchmarks (e.g. DeepSeekMath, 2024). |
 | Books / papers | arXiv, PubMed, public-domain books | Long-form coherence, rare vocabulary. |
 | Reference | Wikipedia, StackExchange | High quality, tiny; usually upweighted. |
 | Synthetic | Model-generated rephrasing, textbooks | Increasingly used in midtraining. Contamination risk. |
@@ -204,7 +223,8 @@ Two families, used together:
 **Heuristic filters** — cheap, interpretable, run first. The canonical sets are
 the C4 rules and the Gopher quality rules:
 
-- drop documents outside a length band (e.g. 50–100k words)
+- drop documents that are too short or too long (Gopher: fewer than 50 words or
+  more than 100,000 words)
 - mean word length outside ~3–10 characters
 - symbol-to-word ratio (`#`, `…`) above ~0.1
 - too few lines ending in terminal punctuation (a C4-style line rule, not a
@@ -318,9 +338,13 @@ filters are biased against.
 
 An underrated source of model pathologies.
 
-**Byte-Pair Encoding (BPE)** is the standard. Start from bytes; repeatedly merge
-the most frequent adjacent pair; stop at a target vocabulary size. Byte-level BPE
-(GPT-2 onward) guarantees no out-of-vocabulary input.
+**Byte-Pair Encoding (BPE)** is the most common family. Start from a base
+alphabet, repeatedly merge the most frequent adjacent pair, and stop at a target
+vocabulary size. Classic BPE starts from characters; **byte-level BPE** (GPT-2
+onward, and what the Part 16 notebook uses) starts from the 256 byte values,
+which guarantees no input is ever out of vocabulary. The other common family is
+**Unigram** (usually via SentencePiece, e.g. T5): it starts from a large
+candidate vocabulary and *prunes* it down, instead of merging up.
 
 **Worked example — four BPE merges.** A toy corpus of word counts:
 `low ×5, lower ×2, newest ×6, widest ×3`. Start from single characters and count
@@ -344,7 +368,7 @@ Key decisions:
 
 | Decision | Typical | Why it matters |
 |---|---|---|
-| Vocab size | 32k–256k | Larger vocab → fewer tokens per document (cheaper training and inference) but a bigger embedding/output matrix and rarer per-token updates. Modern models trend larger (128k+). |
+| Vocab size | 32k–256k | A trade-off, not a free win: a larger vocab means fewer tokens per document, but a bigger embedding/output matrix, more FLOPs per token in the LM head, and rarer per-token updates. Modern models trend larger (128k+). |
 | Pre-tokenization regex | GPT-4 style split | Controls whether digits, whitespace and punctuation can merge into words. Splitting digits individually (or in groups of 3) measurably improves arithmetic. |
 | Whitespace handling | Leading-space attached | `" the"` and `"the"` are different tokens — a classic source of prompt-sensitivity bugs. |
 | Training corpus for the tokenizer | Sample of the real mix | A tokenizer trained on English-only text makes other languages 2–4× more expensive in tokens. |
@@ -356,6 +380,13 @@ tokenizer with 15% lower fertility on your mix means ~15% fewer tokens for the
 same text, so roughly 15% less token-proportional training compute — at a fixed
 architecture, and ignoring the vocabulary-dependent cost of a larger
 embedding/LM head.
+
+That vocabulary cost is concrete. Training the LM head costs `6·d·V` FLOPs per
+token. For the notebook's `small` model (`d = 512`, `V = 16,000`) that is 49M
+FLOPs per token, out of ~210M in total. Doubling `V` to 32k adds another 49M —
+about 23% more work per token — so it only pays off if it cuts the token count by
+more than that. At large `d_model` the head is a much smaller share, which is why
+big models can afford 128k+ vocabularies.
 
 > **How tokenization can make arithmetic harder:** with merged multi-digit
 > tokens, `1234` might segment as `123`+`4` in one context and `12`+`34` in
@@ -425,13 +456,14 @@ autoregressive: position `t` sees only `≤ t`.
 Variants, in the order they were adopted:
 
 - **MHA** (multi-head): `n_heads` separate Q, K, V projections.
-- **MQA** (multi-query): one shared K/V head. Shrinks the KV cache ~`n_heads`×;
-  costs quality.
+- **MQA** (multi-query): one shared K/V head. Shrinks the KV cache ~`n_heads`×,
+  but can degrade quality relative to MHA under the same training.
 - **GQA** (grouped-query): `n_kv_heads` groups, e.g. 8 KV heads for 64 Q heads.
-  The most common choice in open dense models — nearly MHA quality, near-MQA
-  cache size.
+  An intermediate trade-off between MHA and MQA, and the most common choice in
+  open dense models: close to MHA quality at close to MQA cache size.
 - **MLA** (multi-head latent attention, DeepSeek): compress K/V into a
-  low-rank latent, cache the latent. Smaller cache than GQA at better quality.
+  low-rank latent, cache the latent. DeepSeek reports a smaller cache than GQA
+  at better quality.
 
 The KV cache is an *inference* concern, but it constrains *pretraining*
 architecture choices, because you must serve what you train.
@@ -470,14 +502,43 @@ merge heads, · W_o         (24, 512, 512)      back onto the residual stream
 Two numbers worth noticing. The score tensor alone is ~50M entries — ~100 MB in
 bf16, *per layer* — and it grows with `T²`. Never building it is exactly what
 FlashAttention does (Part 9.4). And at inference the KV cache costs
-`2 (K and V) × 8 layers × 2 heads × 64 × 2 bytes = 4 KB` per token; with full MHA
-(8 KV heads) it would be 16 KB. That 4× is the whole reason GQA exists.
+`2 (K and V) × 8 layers × 2 heads × 64 × 2 bytes = 4 KB` per token of context,
+per sequence; with full MHA (8 KV heads) it would be 16 KB. That 4× is the whole
+reason GQA exists. The general formula for a batch of `B` sequences of length
+`T`:
+
+```
+KV-cache bytes = B × T × n_layers × 2 × n_kv_heads × d_head × bytes_per_value
+```
+
+Serving 24 sequences of 512 tokens with this model takes `24 × 512 × 4 KB ≈ 50 MB`.
+It is tiny here, but the same formula gives many gigabytes for a large model at
+long context — that is where the cache, not the weights, limits how many users
+one GPU can serve.
+
+The rest of the block, and the output end of the model, in the same style:
+
+```
+n2(x)                      (24, 512, 512)
+gate = x·W_gate            (24, 512, 1408)     d_ff = 1408
+up   = x·W_up              (24, 512, 1408)
+silu(gate) ⊙ up · W_down   (24, 512, 512)      back onto the residual stream
+... × 8 blocks, then the final norm ...
+logits = x·W_head          (24, 512, 16000)    one score per vocabulary entry
+cross-entropy vs targets   scalar              averaged over 24 × 512 positions
+```
+
+The logits are the largest activation in the model: ~197M entries, ~790 MB in
+fp32 (the precision cross-entropy is computed in). With a 128k vocabulary that
+grows 8×, which is why production stacks use *fused* linear + cross-entropy
+kernels that never materialize the full logit tensor (Part 15.5, Liger-Kernel).
 
 **Positional information.** Vanilla transformers add position embeddings.
 Current practice:
 
-- **RoPE** (rotary): rotate Q and K by a position-dependent angle so that the
-  dot product depends only on *relative* position. Dominant choice. The `theta`
+- **RoPE** (rotary): rotate Q and K by position-dependent angles, so their dot
+  product depends on the two positions only through their *difference* (it still
+  depends on the content of Q and K, of course). Dominant choice. The `theta`
   base (10000 originally, often 500k+ for long-context models) sets the
   wavelength range.
 - **ALiBi**: a linear distance penalty added to attention scores. Simple,
@@ -611,6 +672,23 @@ prefix, never on its own samples. This creates train/inference mismatch
 > identical. A bigger vocabulary packs more text into each token, so per-token
 > loss is mechanically higher even when the model is equally good or better on
 > the same underlying text. BPB removes that artifact.
+
+Where the BPB formula comes from. The per-token loss is an *average*, so
+multiplying it back by the token count gives the total information the model
+needed to encode the text, in nats. Divide by `ln 2` to get bits, and by the byte
+count to put it per byte:
+
+```
+total NLL (nats)  = loss_per_token × n_tokens
+BPB               = total NLL / (ln 2 × n_bytes)
+                  = loss_per_token × n_tokens / (ln 2 × n_bytes)
+```
+
+`n_tokens` is the only tokenizer-dependent quantity in there, and it cancels the
+tokenizer dependence of `loss_per_token`. Perplexity (`exp(loss_per_token)`) has
+no such correction, which is why it cannot compare models with different
+tokenizers. BPB is still only fair when both models are evaluated on the *same*
+text — it removes the tokenizer from the comparison, not differences in data.
 
 **Worked example — the same loss in three units.** A model with a 16,000-token
 vocabulary reaches 1.5 nats/token on validation text that averages 4.2 bytes per
@@ -877,8 +955,19 @@ thumb. The last row is GPT-3's ratio: clearly off the bottom of the bowl.
 
 Chinchilla minimizes *training* compute. Real deployments care about *inference*
 compute, which is paid forever. A smaller model trained far past the optimal
-point — Llama-3-8B saw 15T tokens, ~1875 tokens/param, ~90× Chinchilla — is worse
-per training FLOP but much cheaper to serve.
+point — Llama-3-8B saw 15T tokens, ~1,875 tokens per parameter (counting all 8B),
+about 90× the 20-tokens/param rule of thumb — is worse per training FLOP but much
+cheaper to serve. ("90×" is the tokens-per-parameter ratio, not 90× the compute.)
+
+It helps to separate three different questions people call "optimal":
+
+- **Training-compute optimal** — the lowest loss for a fixed training budget
+  `C = 6ND`. This is what Chinchilla answers.
+- **Inference-aware optimal** — the lowest *total* cost of training the model
+  *plus* serving it for its expected lifetime of queries. Heavy expected usage
+  pushes toward smaller `N` and larger `D` — i.e. overtraining.
+- **Data-constrained optimal** — the best use of compute when you have fewer
+  unique tokens than `D` calls for, so you must repeat data (Part 3.5's ~4 epochs).
 
 **The practical rule:** use Chinchilla to reason about what a *fixed training
 budget* buys. Use inference economics to choose the actual model size. They are
@@ -1230,14 +1319,14 @@ char-level config, one modest GPU. *You now know what attention computes.*
 
 **Rung 3 — Modern architecture (3 days).**
 Rewrite it with RMSNorm, RoPE, GQA, SwiGLU. Train on TinyStories. Generate
-coherent text. *You now know the current stack, not the 2017 one.*
+coherent text. *You now know a modern stack, not the 2017 one.*
 
 **Rung 4 — Real data pipeline (3 days).**
 Download 10GB of FineWeb. Filter, dedup, train a BPE tokenizer, tokenize to
 binary shards, build a memmap loader. *This is the part most tutorials skip and
 most real work consists of.*
 
-**Rung 5 — A real (small) pretraining run (1 week).**
+**Rung 5 — A real (small) pretraining run (~1 week of your time; GPU time varies a lot — see the reality check below).**
 ~100–350M params, ~5–10B tokens, single GPU or one node. Pick the pair
 deliberately: those ranges span ~14 to ~100 tokens/param, from roughly
 Chinchilla-optimal (350M on 7B) to well past it (100M on 10B) — see [Part 8.3](#83-why-most-modern-models-train-past-chinchilla-optimal).
@@ -1264,9 +1353,21 @@ understand the systems layer.*
 - Data: reproduce a published filtering ablation and see if it holds at your scale.
 
 **Compute reality check.** Rungs 1–4 run on a laptop or a single consumer GPU.
-Rung 5 is ~1 GPU-week on a 4090, or a few hundred dollars of rented A100/H100
-time. Rung 7 needs a multi-GPU node for a day or two. Budget accordingly — the
-learning is front-loaded into the cheap rungs.
+Rung 5's GPU time depends heavily on the model size you pick and on how
+efficiently you run it. Pure `6ND` training compute, at 20–40% MFU, on one GPU:
+
+| GPU | 100M params, 5B tokens | 350M params, 10B tokens |
+|---|---|---|
+| H100 | ~0.1–0.2 days | ~0.6–1.2 days |
+| A100 | ~0.3–0.6 days | ~2–4 days |
+| RTX 4090 | ~0.5–1 day | ~4–7 days |
+| RTX 3090 | ~1–2.5 days | ~9–17 days |
+
+Add evaluation, checkpointing and the LM-head/attention FLOPs that `6ND` leaves
+out (Part 9.5), and treat these as lower bounds. The small end of Rung 5 fits a
+weekend on consumer hardware; the large end really wants a rented A100/H100 (a
+few hundred dollars). Rung 7 needs a multi-GPU node for a day or two. Budget
+accordingly — the learning is front-loaded into the cheap rungs.
 
 ---
 
@@ -1568,10 +1669,12 @@ flowchart TD
 
 ### 16.0 Cell map
 
+Runtimes are rough guides: they vary with the GPU, PyTorch version, whether
+`torch.compile` and FlashAttention kick in, and (on Colab) throttling.
 GPU column: **yes** means impractical without one at `small` or `base`. Every
 stage runs on CPU at the `tiny` preset — that is what `tiny` is for.
 
-| Cell | Stage | Runtime (`small` preset) | GPU |
+| Cell | Stage | Illustrative runtime (`small` preset) | GPU |
 |---|---|---|---|
 | 1 | [Setup and config](#stage-1--setup-and-config) | seconds | no |
 | 2 | [Acquire raw text](#stage-2--acquire-raw-text) | 5–20 min | no |
@@ -2602,8 +2705,8 @@ the run. Saving only at the end — which is not checkpointing, it's exporting.
 **Goal.** Held-out loss, bits-per-byte, and generated samples.
 
 **What's happening.** Raw loss is only comparable between identical tokenizers;
-BPB normalizes by the underlying bytes and is the honest cross-model metric
-([Part 6](#6-the-objective-and-the-loss)). Generation is the qualitative check —
+BPB normalizes by the underlying bytes, which makes models with different
+tokenizers comparable on the same text ([Part 6](#6-the-objective-and-the-loss)). Generation is the qualitative check —
 numbers can look fine while output is degenerate.
 
 ```python
