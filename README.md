@@ -93,8 +93,9 @@ compute is such matmuls, so summed over the model it is about `6N` per token and
 Treat `6ND` as an approximation for scaling estimates, not an exact FLOP count.
 It leaves out the attention-score matmuls (which grow with sequence length), the
 LM-head projection, the elementwise work (softmax, norms, activations), and any
-recomputation from activation checkpointing. For large models the error is small;
-for small models or long contexts it is not ([Part 9.5](#95-mfu--the-number-that-matters)
+recomputation from activation checkpointing. Where the transformer-body matmuls dominate,
+the error is often modest; for small models, large vocabularies or long contexts
+it can be substantial ([Part 9.5](#95-mfu--the-number-that-matters)
 shows by how much).
 
 Now scale it to Llama-3-8B, trained on 15T tokens. Its "8B" includes the
@@ -1051,7 +1052,8 @@ different questions.
 ### 8.4 How to actually use scaling laws
 
 1. Pick 5–8 model sizes spanning ~2 orders of magnitude (e.g. 20M → 1B).
-2. Train each on a compute-matched budget with a consistent recipe.
+2. Train each with a consistent recipe and a budget you choose deliberately (a
+   fixed tokens-per-parameter ratio, or equal-FLOP "IsoFLOP" budgets).
 3. Fit the power law; check the residuals.
 4. Extrapolate to your target — and **predict the target loss before you launch**.
 5. If the real run departs from the prediction, investigate — it may be a bug,
@@ -2535,7 +2537,8 @@ entire notebook and is the one most often skipped.
 
 ```python
 # Cell 9 — pre-flight checks
-# 1. Initial loss must be ≈ ln(vocab_size): a fresh model is uniform.
+# 1. Initial loss must be ≈ ln(vocab_size): a fresh model with small, symmetric
+#    logits is approximately uniform, so cross-entropy starts near ln V.
 x, y = train_loader.get_batch(0, device)
 with torch.no_grad():
     _, loss0 = model(x, y)
@@ -3188,6 +3191,13 @@ under-tuned, which biases `alpha`. A proper study would tune or scale the LR per
 size (or use μP). Each model does get its own seed and loss scaler, so re-running
 one size reproduces it.
 
+Second caveat: `D` grows with `N` here (`D = 20N`), so the one-variable fit
+measures an *effective* exponent along that trajectory, not the isolated `α` of
+`L(N, D) = E + A/N^α + B/D^β` from Part 8 — substituting `D = kN` gives a sum of
+two power laws in `N`. Note too that a fixed tokens-per-parameter budget is *not*
+compute-matched: compute is ~`6ND ∝ N²`, so a model with twice the parameters
+gets about four times the compute.
+
 ```python
 # Cell 15 — mini scaling law
 from scipy.optimize import curve_fit
@@ -3201,6 +3211,10 @@ from scipy.optimize import curve_fit
 # Also not perfectly controlled: depth changes with width, and d=320 falls back
 # to MQA (5 heads cannot share 2 KV heads). Treat the fitted exponent as
 # illustrative, not an architecture-independent estimate of alpha.
+# Also: D grows with N here (D = TOK_PER_PARAM * N), so the one-variable fit below
+# measures an EFFECTIVE exponent along the D = kN trajectory: substituting into
+# L(N, D) = E + A/N^a + B/D^b gives E + A*N^-a + B'*N^-b, two power laws, not one.
+# The fitted `alpha` is therefore NOT the isolated `a` of the two-variable law.
 TOK_PER_PARAM = 20
 
 SIZES = [(128, 4), (192, 6), (256, 6), (320, 8), (384, 8), (512, 8)]
@@ -3213,13 +3227,19 @@ for d, L in SIZES:
     n_kv = 2 if n_head % 2 == 0 else 1
     c = Config(**{**PRESETS[PRESET], "d_model": d, "n_layer": L,
                   "n_head": n_head, "n_kv_head": n_kv})
-    torch.manual_seed(cfg.seed + d)     # per-size seed: re-running one size reproduces it
+    # Per-size seed: changes MODEL INITIALIZATION only. The data stream is shared on
+    # purpose -- get_batch(step*accum + micro) is a pure function of the step index,
+    # so every size sees the same first k batches (a controlled comparison).
+    torch.manual_seed(cfg.seed + d)
     m = GPT(c).to(device); n = m.n_params()
     # Each model gets its OWN loss scaler; sharing Stage 11's would carry its
     # scale history into an unrelated model.
     run_scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and not use_bf16))
     tps = c.batch_size * c.grad_accum * c.seq_len
-    c.max_steps = max(200, round(TOK_PER_PARAM * n / tps))   # compute-matched
+    # Fixed tokens-per-parameter budget: D = TOK_PER_PARAM * N. NOT compute-matched --
+    # compute is ~6ND = 6*TOK_PER_PARAM*N^2, so a model with 2x the parameters gets
+    # ~4x the compute (that is the point of a Chinchilla-style D/N sweep).
+    c.max_steps = max(200, round(TOK_PER_PARAM * n / tps))
     equiv_epochs = c.max_steps * tps / train_tokens   # equivalent, not literal --
                                                        # see Stage 6's comment
     if equiv_epochs > 4:  # [Part 3.5] -- repeated data, not model size, will set this loss
@@ -3272,7 +3292,7 @@ instinct, which is the skill this stage exists to build.
 
 **Verify.** The held-out prediction should land within a few percent. Check that
 the printed token counts really do scale with `N` — if they are all equal, the
-compute-matching broke and the fit is measuring convergence, not scale. Check the
+the token budget broke and the fit is measuring convergence, not scale. Check the
 `eq.epochs` column too: at 20 tokens/param the 22M model needs ~450M tokens, which
 is 5+ passes over the `small` corpus. If any size warns, raise `n_docs` toward
 the full TinyStories train split (~2.1M stories) before running this stage —
