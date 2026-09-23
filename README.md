@@ -2010,7 +2010,7 @@ for d in docs:
     s = quality_signals(d)
     fired = [name for name, rule in RULES.items() if rule(s)]
     if fired:
-        counts.update(fired); removed.append((fired[0], d))
+        counts.update(fired); removed.append((fired, d))   # keep EVERY rule that fired
     else:
         kept.append(d)
 
@@ -2019,8 +2019,8 @@ for name, c in counts.most_common():
     print(f"  {name:<16} {c:>7,}  ({100*c/len(docs):.2f}%)")
 
 # THE IMPORTANT PART: read what you threw away.
-for name, d in random.sample(removed, min(5, len(removed))):
-    print(f"\n--- dropped by {name} ---\n{d[:300]}")
+for fired, d in random.sample(removed, min(5, len(removed))):
+    print(f"\n--- dropped by {', '.join(fired)} ---\n{d[:300]}")
 ```
 
 **Verify.** Keep rate should be 50–90% on clean data, 10–40% on raw web. Then
