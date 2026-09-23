@@ -76,8 +76,8 @@ table and the vocabulary-output projection — "non-embedding" for short, though
 that output projection is a matrix, not an embedding table; see the worked
 example below), `D` = training tokens. The 6 comes from
 2 FLOPs per multiply-accumulate × 3 passes (forward, backward w.r.t. inputs,
-backward w.r.t. weights). Every architectural or data decision is really a
-question of *how to spend a fixed C*.
+backward w.r.t. weights). Many pretraining architecture and data decisions
+can be framed as *how to spend a fixed training-compute budget C*.
 
 **Worked example — where the 6 comes from, and what it costs.** Take one linear
 layer `y = x·W` with `W` of shape `d × d`, so `d²` parameters. For one token:
@@ -115,16 +115,15 @@ close enough for a back-of-envelope estimate, but know which convention you're
 using.) Checkpoint 1 below asks you to do the same for a different model — do it
 without looking back here.
 
-**3. Loss is predictable — empirically.** Loss vs. compute follows a power law across ~6 orders
-of magnitude. A *sweep* of small models, trained with one consistent recipe, lets
+**3. Loss is predictable — empirically.** Empirically, loss vs. compute is often well
+approximated by a power law across many orders of magnitude. A *sweep* of small models, trained with one consistent recipe, lets
 you forecast the loss of a run far larger than any of them. The forecast is
 not a guarantee: the further you extrapolate, the more a change in data, recipe or
 batch regime can bend the curve. Still, this is why pretraining is an
 engineering discipline and not alchemy — you de-risk at small scale.
 
-**4. Data quality can move the curve, not just the point.** Better data doesn't only
-give a lower loss at the same compute; it changes the slope of what you get per
-FLOP on downstream tasks. Improvements in data curation, filtering,
+**4. Data quality can move the curve, not just the point.** Better data can change not only
+performance at a fixed compute budget but also the observed scaling behaviour. Improvements in data curation, filtering,
 deduplication and mixture design have plausibly mattered as much as any single
 architectural change (RoPE, GQA, SwiGLU, MoE) to recent open-model progress —
 a claim this guide leans on to justify Part 3's length, not a settled measurement.
@@ -331,7 +330,7 @@ import numpy as np, torch
 data = np.memmap("train.bin", dtype=np.uint16, mode="r")
 
 def get_batch(B, T, device):
-    ix = torch.randint(len(data) - T - 1, (B,))
+    ix = torch.randint(len(data) - T, (B,))    # starts 0 .. len-T-1 (high is exclusive)
     x = torch.stack([torch.from_numpy(data[i:i+T].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data[i+1:i+1+T].astype(np.int64)) for i in ix])
     return x.pin_memory().to(device, non_blocking=True), \
@@ -405,7 +404,9 @@ architecture, and ignoring the vocabulary-dependent cost of a larger
 embedding/LM head.
 
 That vocabulary cost is concrete. Training the LM head costs `6·d·V` FLOPs per
-token. For the notebook's `small` model (`d = 512`, `V = 16,000`) that is 49M
+token (the dense output projection's work; with tied weights the *input*
+embedding is a table lookup, not a dense matmul, so tying does not add a second
+such cost). For the notebook's `small` model (`d = 512`, `V = 16,000`) that is 49M
 FLOPs per token, out of ~210M in total. Doubling `V` to 32k adds another 49M —
 about 23% more work per token — so it only pays off if it cuts the token count by
 more than that. At large `d_model` the head is a much smaller share, which is why
@@ -730,8 +731,11 @@ BPB               = total NLL / (ln 2 × n_bytes)
                   = loss_per_token × n_tokens / (ln 2 × n_bytes)
 ```
 
-`n_tokens` is the only tokenizer-dependent quantity in there, and it cancels the
-tokenizer dependence of `loss_per_token`. One bookkeeping rule matters in
+Multiplying the average token loss by the number of scored tokens recovers the
+total negative log-likelihood; dividing by the bytes of the same underlying text
+expresses that likelihood in a tokenizer-independent unit. (Different tokenizers
+still define different modelling problems -- BPB is a common unit, not a proof
+that they are equally hard.) One bookkeeping rule matters in
 practice: the numerator must sum the loss over exactly the tokens whose bytes
 are in the denominator. A token stream with injected separators (EOT) has
 targets with no bytes, so their loss must be excluded from the sum — averaging
@@ -2255,8 +2259,10 @@ train_00001.bin, ...` layout Part 3.6 describes for real pipelines — one file
 per split is enough at TinyStories scale and keeps the notebook's `Loader`
 simple. `CHUNK` below controls how many documents go into one
 `tok.encode_batch()` call (tokenizer throughput and the progress-bar
-granularity); it has no bearing on memory, since every encoded document is
-written straight to disk rather than held in an array.
+granularity) and how much is in memory at once: `encode_batch` returns the whole
+chunk's encodings before the inner loop consumes them, so a larger `CHUNK` means
+more peak RAM. Only ONE encoded chunk is materialised at a time, never the whole
+split -- that is the difference from accumulating everything and concatenating.
 
 ```python
 # Cell 6 — tokenize to flat binary
@@ -2332,7 +2338,10 @@ class Loader:
         # hardcoding it, since Stage 6 picks uint16 vs uint32 from vocab_size.
         self.data = np.memmap(path, dtype=dtype, mode="r")
         self.B, self.T, self.seed = batch_size, seq_len, seed
-        self.n_start = len(self.data) - seq_len - 1
+        # A window needs seq_len+1 tokens starting at i, so valid starts are
+        # 0 .. len-seq_len-1 -- that is len-seq_len of them, and rng.integers(0, n)
+        # excludes n. (`- 1` here would silently never sample the last valid start.)
+        self.n_start = len(self.data) - seq_len
         assert self.n_start > 0, "corpus shorter than one sequence"
 
     def get_batch(self, step, device):
@@ -2966,9 +2975,11 @@ val_meta = json.load(open(f"{cfg.data_dir}/val_meta.json"))
 @torch.no_grad()
 def evaluate_corpus(model, data, T, bs=4):
     """Score every target token once, in non-overlapping BLOCKS of length T.
-    Context is reset at each block boundary: a token at position 700 is predicted
-    from tokens 512..699, not from 0..699. That is the standard fixed-block
-    convention; it slightly overestimates the loss compared with sliding-window
+    The (input t, target t+1) pairs are partitioned into non-overlapping blocks;
+    each block gets up to T tokens of local left context and context from earlier
+    blocks is discarded (a target at position 700 sees tokens 512..699, not
+    0..699). Every target is still scored exactly once. That is the standard
+    fixed-block convention; it slightly overestimates the loss compared with sliding-window
     evaluation (stride < T, scoring only the new targets), which is costlier.
     The split is scored as ONE concatenated, EOT-separated stream (see the note
     after the call below).
