@@ -2748,7 +2748,12 @@ start_step = 0
 resume_path = f"{cfg.out_dir}/last.pt"
 if os.path.exists(resume_path):
     try:
-        model, optimizer, start_step, cfg, hist = load_ckpt(resume_path, device)  # Stage 12
+        m_, o_, s_, c_, h_ = load_ckpt(resume_path, device)  # Stage 12
+        # The loaders were built from the CURRENT cfg; the checkpoint brings its own.
+        if (train_loader.B, train_loader.T) != (c_.batch_size, c_.seq_len):
+            raise ValueError(f"loader is B={train_loader.B},T={train_loader.T} but the "
+                             f"checkpoint used B={c_.batch_size},T={c_.seq_len}")
+        model, optimizer, start_step, cfg, hist = m_, o_, s_, c_, h_
         print(f"resumed from step {start_step}")
     except ValueError as e:      # stale checkpoint from an older tokenizer/data build
         print(f"NOT resuming: {e}")
@@ -2936,6 +2941,12 @@ def load_ckpt(path, device):
 ```python
 # Cell 12b — prove the round trip actually works
 m2, o2, s2, c2, h2 = load_ckpt(f"{cfg.out_dir}/final.pt", device)
+# Scaler and RNG: load_ckpt just restored them, so they must equal what the file holds.
+ck = torch.load(f"{cfg.out_dir}/final.pt", map_location="cpu", weights_only=False)
+assert torch.equal(torch.get_rng_state(), ck["torch_rng"].cpu()), "CPU RNG not restored"
+if ck.get("scaler"):
+    assert scaler.state_dict() == ck["scaler"], "GradScaler state not restored"
+del ck
 xb, yb = val_loader.get_batch(0, device)
 was_training = model.training
 model.eval(); m2.eval()      # deterministic mode, so this stays valid if dropout is added
@@ -3172,7 +3183,10 @@ anneal_loader = Loader(f"{cfg.data_dir}/anneal.bin", cfg.batch_size, cfg.seq_len
 
 def decay_from_stable(loader, tag):
     """Branch from the end of the stable phase and run the SAME decay on `loader`."""
+    # load_ckpt restores model, optimizer, GradScaler AND both RNGs, so every arm starts
+    # from exactly the same training state; only `loader` differs between arms.
     m, o, step0, c, _ = load_ckpt(f"{cfg.out_dir}/stable_end.pt", device)
+    assert step0 == STABLE_END, f"branch point is step {step0}, expected {STABLE_END}"
     m.train()
     for s in range(DECAY_STEPS):
         lr = lr_at(step0 + s, c)                  # the real WSD decay tail
