@@ -2053,7 +2053,9 @@ import hashlib
 NUM_PERM, N_GRAM, BANDS = 128, 5, 16
 ROWS      = NUM_PERM // BANDS
 THRESHOLD = (1 / BANDS) ** (1 / ROWS)      # steepest point of the S-curve: ~0.71
-JACCARD_MIN = 0.7                          # verification cutoff (see below)
+JACCARD_MIN = 0.7      # cutoff on the ESTIMATED Jaccard (fraction of matching
+                       # signature entries) -- not exact; with 128 permutations
+                       # the standard error is ~0.04 at s=0.7
 
 rng = np.random.default_rng(cfg.seed)
 # Keep a,h < 2**31 so a*h + b stays inside uint64 and the modulus is real
@@ -2095,7 +2097,7 @@ for i, sig in enumerate(sigs):
             buckets.setdefault(key, []).append(i)
 
 deduped = [d for i, d in enumerate(kept) if i not in dup_of]
-print(f"threshold≈{THRESHOLD:.2f} (verified at ≥{JACCARD_MIN})")
+print(f"threshold≈{THRESHOLD:.2f} (candidates kept as duplicates at estimated Jaccard ≥{JACCARD_MIN})")
 print(f"removed {len(dup_of):,} near-duplicates -> {len(deduped):,} docs")
 
 if dup_of:                       # always eyeball a matched pair
