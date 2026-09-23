@@ -2749,6 +2749,12 @@ resume_path = f"{cfg.out_dir}/last.pt"
 if os.path.exists(resume_path):
     model, optimizer, start_step, cfg, hist = load_ckpt(resume_path, device)  # Stage 12
     print(f"resumed from step {start_step}")
+    # cfg and model were REPLACED by the checkpoint's: recompute everything derived
+    # from them, so nothing above silently describes the pre-resume configuration.
+    N = getattr(model, "_orig_mod", model).n_params()
+    TOKENS_PER_STEP = cfg.batch_size * cfg.grad_accum * cfg.seq_len
+    FLOPS_PER_TOKEN = flops_per_token(cfg, N)
+    FLOPS_6N        = 6 * N
 
 STABLE_END = cfg.max_steps - int(cfg.decay_frac * cfg.max_steps)
 model.train(); t0 = time.time()
@@ -3137,9 +3143,12 @@ print(f"anneal corpus: top {n_anneal:,} of {len(train_docs):,} train docs "
 # fail. This one catches a val document that also appears in train by text.
 assert not (set(anneal_docs) & set(val_docs)), "val leaked in"
 
-np.concatenate([np.array(e.ids + [EOT], dtype=token_dtype)   # from Stage 6/7
-                for e in tok.encode_batch(anneal_docs)]).tofile(
-                f"{cfg.data_dir}/anneal.bin")
+# Stream to disk in chunks, as Stage 6 does: never hold every Encoding (or one giant
+# concatenated array) in RAM, so this still works when the corpus is not tiny.
+with open(f"{cfg.data_dir}/anneal.bin", "wb") as fh:
+    for i in range(0, len(anneal_docs), 1000):
+        for enc in tok.encode_batch(anneal_docs[i:i + 1000]):
+            np.asarray(enc.ids + [EOT], dtype=token_dtype).tofile(fh)
 anneal_loader = Loader(f"{cfg.data_dir}/anneal.bin", cfg.batch_size, cfg.seq_len, 7,
                        dtype=token_dtype)
 
@@ -3252,9 +3261,10 @@ for d, L in SIZES:
     n_kv = 2 if n_head % 2 == 0 else 1
     c = Config(**{**PRESETS[PRESET], "d_model": d, "n_layer": L,
                   "n_head": n_head, "n_kv_head": n_kv})
-    # Per-size seed: changes MODEL INITIALIZATION only. The data stream is shared on
-    # purpose -- get_batch(step*accum + micro) is a pure function of the step index,
-    # so every size sees the same first k batches (a controlled comparison).
+    # Per-size seed: changes MODEL INITIALIZATION only. Sizes share a PREFIX of
+    # one data stream -- get_batch(step*accum + micro) is a pure function of the step
+    # index, so every size sees the same first k batches; bigger models (more steps,
+    # since D ~ N) simply continue further along it.
     torch.manual_seed(cfg.seed + d)
     m = GPT(c).to(device); n = m.n_params()
     # Each model gets its OWN loss scaler; sharing Stage 11's would carry its
@@ -3305,7 +3315,13 @@ Ns = np.array([r[0] for r in results]); Ls = np.array([r[1] for r in results])
 law = lambda N, E, A, alpha: E + A * N ** (-alpha)
 # Fit on all but the largest, then predict it. 5 points / 3 parameters is still
 # thin -- treat a good hit as encouraging, not as validation.
-(E, A, alpha), _ = curve_fit(law, Ns[:-1], Ls[:-1], p0=[1.0, 100.0, 0.3], maxfev=20000)
+(E, A, alpha), _ = curve_fit(law, Ns[:-1], Ls[:-1], p0=[1.0, 100.0, 0.3],
+                          bounds=([0, 0, 0], [np.inf, np.inf, 2.0]), maxfev=20000)
+# Bounds keep the fit physical (loss floor E >= 0, A >= 0, exponent in [0, 2]); with
+# 4 noisy points an unconstrained fit can return a negative A or alpha and still
+# pass through the data. If E lands near the smallest observed loss, the fit is
+# extrapolating a floor it cannot see: treat the exponent as illustrative.
+if E > 0.9 * Ls.min(): print(f"WARNING: fitted floor E={E:.2f} is close to the lowest observed loss")
 pred = law(Ns[-1], E, A, alpha)
 print(f"\nL(N) = {E:.3f} + {A:.1f}·N^-{alpha:.3f}   (fit on {len(Ns)-1} points)")
 print(f"held-out largest: predicted {pred:.4f}  actual {Ls[-1]:.4f}  "
