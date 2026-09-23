@@ -1989,6 +1989,8 @@ def quality_signals(doc):
     }
 
 RULES = {   # name -> predicate that is True when the doc should be DROPPED
+    # Deliberately looser than Gopher's ~50-word minimum (Part 3.2): TinyStories
+    # are short by design. On web text, use ~50.
     "too_short":      lambda s: s["n_words"] < 30,
     "too_long":       lambda s: s["n_words"] > 100_000,
     "odd_word_len":   lambda s: not (3.0 <= s["mean_word_len"] <= 10.0),
