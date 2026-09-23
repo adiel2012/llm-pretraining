@@ -728,7 +728,12 @@ BPB               = total NLL / (ln 2 × n_bytes)
 ```
 
 `n_tokens` is the only tokenizer-dependent quantity in there, and it cancels the
-tokenizer dependence of `loss_per_token`. Perplexity (`exp(loss_per_token)`) has
+tokenizer dependence of `loss_per_token`. One bookkeeping rule matters in
+practice: the numerator must sum the loss over exactly the tokens whose bytes
+are in the denominator. A token stream with injected separators (EOT) has
+targets with no bytes, so their loss must be excluded from the sum — averaging
+over all targets and then multiplying by a content-token count mixes the two
+(Stage 13 does it correctly). Perplexity (`exp(loss_per_token)`) has
 no such correction, which is why it cannot compare models with different
 tokenizers. BPB is still only fair when both models are evaluated on the *same*
 text — it removes the tokenizer from the comparison, not differences in data.
@@ -2887,14 +2892,53 @@ numbers can look fine while output is degenerate.
 ```python
 # Cell 13 — evaluation
 val_meta = json.load(open(f"{cfg.data_dir}/val_meta.json"))
-val_loss = estimate_loss(model, val_loader, n_batches=50)
-# Use CONTENT tokens, not n_tokens: the injected EOT separators have no
-# corresponding bytes, so including them inflates BPB.
-bpb = val_loss * val_meta["n_content_tokens"] / (math.log(2) * val_meta["n_bytes"])
+
+@torch.no_grad()
+def evaluate_corpus(model, data, T, bs=4):
+    """One pass over the WHOLE token array in non-overlapping windows.
+    Returns (sum of NLL in nats over CONTENT targets, number of such targets).
+    Targets equal to EOT are masked out: the injected separators have no bytes,
+    so their loss must not enter a bits-per-BYTE numerator. (`estimate_loss`
+    cannot do this -- it averages over every target in randomly sampled windows,
+    EOT included, and may measure some tokens twice and others never.)"""
+    net = getattr(model, "_orig_mod", model)        # uncompiled: window shapes vary
+    was_training = net.training; net.eval()
+    t = torch.from_numpy(np.asarray(data, dtype=np.int64))
+    n = t.numel() - 1                                # number of (input, target) pairs
+    nll, cnt = 0.0, 0
+
+    def run(x, y):
+        with autocast: logits, _ = net(x.to(device))
+        y = y.to(device).reshape(-1)
+        l = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y,
+                            reduction="none")
+        keep = y != EOT
+        return l[keep].sum().item(), int(keep.sum())
+
+    starts = list(range(0, n - T + 1, T))            # full windows
+    for b in range(0, len(starts), bs):
+        idx = starts[b:b + bs]
+        a, c = run(torch.stack([t[s:s + T]         for s in idx]),
+                   torch.stack([t[s + 1:s + T + 1] for s in idx]))
+        nll += a; cnt += c
+    tail = (starts[-1] + T) if starts else 0
+    if tail < n:                                     # shorter remainder window
+        a, c = run(t[tail:n][None], t[tail + 1:n + 1][None])
+        nll += a; cnt += c
+    net.train(was_training)
+    return nll, cnt
+
+nll, n_eval = evaluate_corpus(model, val_loader.data, cfg.seq_len)
+# Every content token is scored except the file's very first (no context to
+# predict it from), so n_eval should equal n_content_tokens - 1.
+assert abs(n_eval - val_meta["n_content_tokens"]) <= 1, (n_eval, val_meta)
+val_loss = nll / n_eval                              # nats per content token
+bpb = nll / (math.log(2) * val_meta["n_bytes"])      # total content NLL / total bytes
 print(f"val loss {val_loss:.4f} | ppl {math.exp(val_loss):.2f} | BPB {bpb:.4f}")
 
 @torch.no_grad()
 def generate(model, prompt, max_new=120, temp=0.8, top_k=50):
+    was_training = model.training
     model.eval()
     ids = torch.tensor([tok.encode(prompt).ids], device=device)
     for _ in range(max_new):
@@ -2907,7 +2951,7 @@ def generate(model, prompt, max_new=120, temp=0.8, top_k=50):
         nxt = torch.multinomial(F.softmax(logits, -1), 1)
         if nxt.item() == EOT: break
         ids = torch.cat([ids, nxt], dim=1)
-    model.train()
+    model.train(was_training)                        # restore, don't force train mode
     return tok.decode(ids[0].tolist())
 
 for p in ["Once upon a time", "The little robot"]:
@@ -2933,6 +2977,12 @@ norm history in Stage 11's plots before assuming it's the temperature.
 
 **Breaks like this.** Comparing raw loss across runs with different vocab sizes —
 always use BPB. Evaluating without `model.eval()` if you later add dropout.
+Computing BPB as `mean_loss × n_content_tokens / (ln 2 × n_bytes)` from a loss
+that was averaged over windows *including* EOT targets: numerator and
+denominator then count different tokens. The sum of content-only NLL, divided by
+bytes, is the quantity the formula means. Non-overlapping windows also start
+each window with no left context, so this slightly overestimates the loss
+compared with sliding-window evaluation.
 
 ---
 
