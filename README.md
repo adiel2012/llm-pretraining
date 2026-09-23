@@ -377,10 +377,13 @@ adjacent pairs, weighting each by how often its word occurs:
 
 (Steps 1 and 3 had ties — `s t` also scored 9, `o w` also 7. Tie-breaking is an
 implementation detail.) After four merges, `newest` is `n e w est` — 4 tokens
-instead of 6 — and `low` is a single token. A real tokenizer repeats this tens of
-thousands of times, starting from bytes; the ordered list of merges *is* the
-tokenizer. Words it never merged simply stay split into smaller pieces, which is
-why nothing is ever out of vocabulary.
+instead of 6 — and `low` is a single token. This demo starts from characters,
+as classic BPE does; a production byte-level BPE tokenizer runs the identical
+merge procedure starting from bytes instead, tens of thousands of times, and
+the ordered list of merges *is* the tokenizer either way. Words it never merged
+simply stay split into smaller pieces, which is why nothing is ever out of
+vocabulary — bytes guarantee this outright, since every input decomposes into
+the 256-symbol base alphabet.
 
 Key decisions:
 
@@ -782,9 +785,10 @@ optimizer = torch.optim.AdamW(
 ```
 
 - `β₂ = 0.95` (rather than 0.999) shortens the second-moment window from ~1,000
-  steps to ~20, so the optimizer adapts faster when gradient scale shifts. It has
-  been the common LLM setting since GPT-3 (Brown et al., 2020) and is generally
-  credited with fewer loss spikes at large batch sizes.
+  steps to ~20, so the optimizer adapts faster when gradient scale shifts —
+  one reason it's commonly used in large-model training, alongside anecdotal
+  reports of fewer loss spikes. It has been the standard LLM setting since
+  GPT-3 (Brown et al., 2020).
 - **Weight decay applies to matrices, not to norms and biases.** The usual
   implementation splits on `dim >= 2`. Note what that rule actually does:
   `nn.Embedding.weight` is 2-D, so it *is* decayed — nanoGPT and many production
