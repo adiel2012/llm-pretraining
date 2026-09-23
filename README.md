@@ -2069,19 +2069,23 @@ def signature(doc):
 
 sigs = [signature(d) for d in kept]
 
-buckets, dup_of = {}, {}
+buckets, dup_of = {}, {}       # bucket key -> LIST of kept doc ids
 for i, sig in enumerate(sigs):
-    for b in range(BANDS):
-        key = (b, sig[b*ROWS:(b+1)*ROWS].tobytes())
-        cand = buckets.get(key)
-        if cand is not None:
-            # A band collision is a CANDIDATE, not a duplicate. Verify with the
-            # signature Jaccard estimate before discarding a document.
+    keys = [(b, sig[b*ROWS:(b+1)*ROWS].tobytes()) for b in range(BANDS)]
+    for key in keys:
+        # A band collision is a CANDIDATE, not a duplicate. Verify each
+        # candidate with the signature Jaccard estimate. A bucket holds a
+        # LIST: keeping only its first member would compare every later
+        # document against that one alone, and a true near-duplicate of the
+        # second member would slip through.
+        for cand in buckets.get(key, ()):
             est = float((sigs[i] == sigs[cand]).mean())
             if est >= JACCARD_MIN:
                 dup_of[i] = (cand, est); break
-        else:
-            buckets[key] = i
+        if i in dup_of: break
+    if i not in dup_of:                       # only survivors join the buckets
+        for key in keys:
+            buckets.setdefault(key, []).append(i)
 
 deduped = [d for i, d in enumerate(kept) if i not in dup_of]
 print(f"threshold≈{THRESHOLD:.2f} (verified at ≥{JACCARD_MIN})")
@@ -2120,7 +2124,9 @@ TinyStories expect a few percent; on raw Common Crawl, 30–60% is normal.
 
 **Breaks like this.** Treating a band collision as a confirmed duplicate — LSH
 gives you *candidates*, and skipping the verification step deletes unrelated
-documents. Silent integer overflow: drawing `A` up to 2⁶¹ (as `datasketch` does)
+documents. The mirror-image bug: storing one document per bucket, so a
+candidate that fails verification permanently shadows every later document in
+that bucket. Buckets are lists. Silent integer overflow: drawing `A` up to 2⁶¹ (as `datasketch` does)
 with 32-bit hashes makes `A*h` exceed uint64 and wrap before the modulus applies,
 so "mod p" is not what runs. That is why this cell draws `A` and `B` below 2³¹.
 It is mostly harmless in practice, but it means the code is not doing what it
@@ -2167,7 +2173,7 @@ EOT = tok.token_to_id("<|endoftext|>")
 assert tok.get_vocab_size() <= 2**32 - 1, "vocab size doesn't fit in uint32"
 
 # fertility = tokens per word: the number that decides your effective compute
-sample = train_docs[:2000]
+sample = val_docs[:2000]       # held-out text, as Part 4 advises for comparing tokenizers
 n_tok = sum(len(tok.encode(d).ids) for d in sample)
 n_word = sum(len(d.split()) for d in sample)
 print(f"vocab={tok.get_vocab_size()}  fertility={n_tok/n_word:.3f} tok/word")
