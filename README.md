@@ -1813,7 +1813,7 @@ exact same code.
 
 ```python
 # Cell 1 — config
-!pip install -q torch numpy scipy datasets tokenizers tqdm matplotlib
+!pip install -q torch numpy scipy datasets tokenizers tqdm matplotlib ftfy
 
 import math, os, time, json, random
 from dataclasses import dataclass, asdict, field
@@ -1950,12 +1950,29 @@ for i, ex in enumerate(ds):
 # docs = [ex["text"] for i, ex in zip(range(cfg.n_docs), ds)]
 
 print(f"{len(docs):,} docs, {sum(len(d) for d in docs)/1e6:.1f}M chars")
+
+# The TinyStories copy on the Hub contains MOJIBAKE: UTF-8 that was decoded as
+# cp1252 somewhere upstream, so “ arrives as "â€œ". Three documents read in
+# Stage 2 looked clean; Stage 3's "read what you threw away" printout is what
+# exposed it (the rejected documents were full of it). Repair it here, before
+# anything filters or tokenizes -- otherwise the tokenizer spends merges on it.
+# ftfy.fix_text also uncurls quotes, which is what Stage 3's punctuation rule expects.
+import ftfy
+n_fixed = 0
+for i, d in enumerate(docs):
+    fixed = ftfy.fix_text(d)
+    n_fixed += (fixed != d)
+    docs[i] = fixed
+print(f"repaired text in {n_fixed:,} / {len(docs):,} docs")
 print("-" * 60); print(docs[0][:600])
 ```
 
 **Verify.** Print three full documents and read them. You are looking for
 encoding mojibake, HTML remnants, and truncation. Ten seconds here saves a
-retrain.
+retrain — but three documents is a small sample, and on TinyStories it missed
+the mojibake entirely: only the rejected-document printout in Stage 3 revealed
+it. Check for `â€` in the text (`sum('â€' in d for d in docs)` should be 0 after
+the repair) rather than trusting a glance.
 
 **Breaks like this.** Streaming datasets silently yielding fewer docs than asked;
 a field name that isn't `"text"` for your chosen dataset.
@@ -1977,7 +1994,7 @@ import re
 from collections import Counter
 
 STOPWORDS = {"the","be","to","of","and","that","have","with","this","it","is","in"}
-TERMINAL  = (".", "!", "?", '"', "'")
+TERMINAL  = (".", "!", "?", '"', "'", "”", "’")   # curly closers too, in case text isn't uncurled
 
 def quality_signals(doc):
     words = doc.split()
@@ -2781,7 +2798,7 @@ at `d_model=512` you are launch-latency bound, and 15–25% is normal.
 |---|---|---|
 | Loss at step ~100 | below the unigram entropy (~5–6 nats) | data or label bug |
 | Grad norm | settles to a stable band, spikes rare | instability brewing ([Part 10](#10-stability-when-training-breaks)) |
-| MFU (fuller estimate) | 15–25% at this size; 35–55% on a large, well-shaped run | dataloader stall, no compile, bad shapes |
+| MFU (fuller estimate) | `small`: 15–25%; `tiny` (0.8M params): only ~2–5% — measured 4% on a T4, launch-bound; 35–55% on a large, well-shaped run | dataloader stall, no compile, bad shapes |
 | Val − train loss | small and stable | too few tokens per parameter |
 
 **Breaks like this.** Calling `.item()` on every micro-step forces a GPU sync and
@@ -2888,7 +2905,7 @@ assert not missing, f"missing {missing}: run Stages 2-6 once first"
 tok  = Tokenizer.from_file(f"{cfg.data_dir}/tokenizer.json")
 EOT  = tok.token_to_id("<|endoftext|>")
 meta = json.load(open(f"{cfg.data_dir}/train_meta.json"))
-print(f"loaded tokenizer + shards; last.pt present: "
+print(f"loaded tokenizer + token files; last.pt present: "
       f"{os.path.exists(f'{cfg.out_dir}/last.pt')}")
 ```
 
@@ -3114,7 +3131,11 @@ print("\n--- anneal  ---\n",  generate(m_anneal, "Once upon a time"))
 TinyStories — already clean and homogeneous — an honest prediction is "close to
 zero, possibly negative", because there isn't much quality headroom to exploit
 and the anneal corpus is a narrower slice of the same distribution, seen twice.
-A near-zero result here is a *correct* experiment, not a failed one.
+A near-zero result here is a *correct* experiment, not a failed one. So is a
+clearly negative one: a first `tiny` run on a T4 gave control 2.745 vs anneal
+2.890 (−0.146 nats). One plausible reason — not tested — is that the
+top-scoring 1.9k documents are a narrower slice than the full corpus, so the
+anneal arm sees less variety in the same number of steps.
 
 **Verify.** The two arms differ only in data. If the deltas are within run-to-run
 noise, your proxy didn't separate quality — which is the common outcome on a
