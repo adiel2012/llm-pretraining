@@ -1972,6 +1972,12 @@ import ftfy
 n_fixed = 0
 for i, d in enumerate(docs):
     fixed = ftfy.fix_text(d)
+    # ftfy repairs COMPLETE sequences, but here the closing quote arrives as a bare
+    # "â€": its third byte (0x9D, undefined in cp1252) was lost upstream, and ftfy
+    # leaves that alone. Measured on a real run: 560 of 20,000 documents still had
+    # it after ftfy, and those lines then end in a non-punctuation character, so
+    # Stage 3 still dropped 201 documents. The residue is a closing double quote.
+    fixed = fixed.replace("â€", '"')
     n_fixed += (fixed != d)
     docs[i] = fixed
 print(f"repaired text in {n_fixed:,} / {len(docs):,} docs")
@@ -1983,7 +1989,10 @@ encoding mojibake, HTML remnants, and truncation. Ten seconds here saves a
 retrain — but three documents is a small sample, and on TinyStories it missed
 the mojibake entirely: only the rejected-document printout in Stage 3 revealed
 it. Check for `â€` in the text (`sum('â€' in d for d in docs)` should be 0 after
-the repair) rather than trusting a glance.
+the repair) rather than trusting a glance. That check earned its keep: on a first
+run, `ftfy` alone left 560 of 20,000 documents with a bare `â€` (a closing quote
+whose last byte was lost upstream), so the count was NOT 0 and Stage 3 still
+dropped 201 documents. A repair is only done when its verification says so.
 
 **Breaks like this.** Streaming datasets silently yielding fewer docs than asked;
 a field name that isn't `"text"` for your chosen dataset.
