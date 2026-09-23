@@ -184,8 +184,12 @@ loss = −ln p[0]    = −ln 0.665 = 0.408 nats
 
 Read the gradient as an instruction: push the correct logit up, and push each
 wrong logit down in proportion to the probability it took. The components sum to
-zero and each stays within `[−1, 1]` however extreme the logits get — that
-boundedness is the "numerically well-behaved" part.
+zero and each stays within `[−1, 1]` however extreme the logits get. That bounded
+gradient *at the output* is one reason softmax + cross-entropy is numerically
+convenient. It does not mean gradients stay bounded all the way down a deep
+network — they can still explode or vanish on the way back, which is what
+normalization, residual connections, careful init and gradient clipping are for
+(Parts 5, 7 and 10).
 
 **Fastest path if rusty:** Karpathy's *Neural Networks: Zero to Hero* videos 1–4
 (micrograd → makemore → attention). ~8 hours, and you write every line.
@@ -208,10 +212,10 @@ should get 40%.
 
 | Source | Rough scale | Notes |
 |---|---|---|
-| Common Crawl | ~100B pages, petabytes of WARC | The base of nearly every open corpus. Typically ~90% gets filtered away (RefinedWeb). |
-| Curated web | FineWeb (15T), DCLM-Baseline (4T), RefinedWeb (5T) | Pre-filtered CC derivatives. **Start here** — don't re-do CC processing. |
-| Code | The Stack v2, GitHub | Has been reported to improve reasoning even on non-code evals (e.g. *To Code, or Not To Code?*, 2024). |
-| Math | OpenWebMath, proof corpora, arXiv | Small volume, large measured effect on math benchmarks (e.g. DeepSeekMath, 2024). |
+| Common Crawl | ~100B pages, petabytes of WARC | The base of nearly every open corpus. RefinedWeb's own pipeline removes ~90% of documents — about 50% for non-English language ID, then ~24% of the remainder for quality, ~12% of what's left as duplicates ([Penedo et al., 2023](https://arxiv.org/abs/2306.01116)). |
+| Curated web | FineWeb (15T), DCLM-Baseline (4T), RefinedWeb (5T) | Pre-filtered CC derivatives ([FineWeb](https://arxiv.org/abs/2406.17557); [DCLM](https://arxiv.org/abs/2406.11794); [RefinedWeb](https://arxiv.org/abs/2306.01116)). **Start here** — don't re-do CC processing. |
+| Code | The Stack v2, GitHub | Adding code to the pretraining mix improved natural-language reasoning by up to 8.2% and world-knowledge tasks by up to 4.2% in controlled ablations at 470M–2.8B params ([Aryabumi et al., 2024](https://arxiv.org/abs/2408.10914)). |
+| Math | OpenWebMath, proof corpora, arXiv | Small volume, large measured effect: DeepSeekMath's math-heavy continued pretraining drove major gains on math benchmarks at a few-percent-of-corpus scale ([Shao et al., 2024](https://arxiv.org/abs/2402.03300)). |
 | Books / papers | arXiv, PubMed, public-domain books | Long-form coherence, rare vocabulary. |
 | Reference | Wikipedia, StackExchange | High quality, tiny; usually upweighted. |
 | Synthetic | Model-generated rephrasing, textbooks | Increasingly used in midtraining. Contamination risk. |
@@ -277,9 +281,11 @@ fewer rows each shift the curve left: more duplicates caught, but more false
 candidates to verify.
 
 Also decide *scope*: dedup within a crawl dump, or globally across all dumps?
-FineWeb found per-dump dedup outperformed global dedup — over-deduplication
+FineWeb found per-dump dedup outperformed global dedup in their ablations
+([Penedo et al., 2024](https://arxiv.org/abs/2406.17557)) — over-deduplication
 strips away genuinely useful repeated content (e.g. widely-mirrored reference
-text). This is a real, counterintuitive result worth remembering.
+text). This is a real, counterintuitive result worth remembering, though it is
+one dataset's finding, not a universal law — check it if you change corpora.
 
 ### 3.4 Decontamination
 
@@ -293,10 +299,13 @@ reason a published eval score is meaningless.
 You have domain buckets and a token budget. Weights matter:
 
 - Upsample high-quality, low-volume sources (Wikipedia, math) — but epoching the
-  same tokens >~4 times shows clear diminishing returns and eventually hurts.
+  same tokens more than ~4 times shows clear diminishing returns and eventually
+  hurts, per controlled data-constrained scaling experiments up to 900B tokens
+  and 9B parameters ([Muennighoff et al., 2023](https://arxiv.org/abs/2305.16264)).
 - Code fraction of ~10–20% is common even for general-purpose models.
 - Domain weights can be tuned by proxy: train many small models on candidate
-  mixes, fit the loss, extrapolate (this is what DoReMi and related methods do).
+  mixes, fit the loss, extrapolate — this is the DoReMi approach
+  ([Xie et al., 2023](https://arxiv.org/abs/2305.10429)).
 - The mix usually *changes over training*: more web early, more high-quality and
   domain-specific data in the final anneal phase.
 
@@ -322,8 +331,10 @@ def get_batch(B, T, device):
 
 Note what this does *not* do: it doesn't respect document boundaries. Sequences
 cross documents. Most large runs accept this (with a separator token and
-sometimes an attention mask that blocks cross-document attention — "document
-masking", which measurably helps).
+sometimes an attention mask that blocks cross-document attention — "intra-document"
+or "document masking", which measurably improved downstream tasks in controlled
+ablations, e.g. +11.6% in-context learning and +9.8% knowledge memorization in
+one study — [Zhao et al., 2024](https://arxiv.org/abs/2402.13991)).
 
 ### Checkpoint 3
 
@@ -369,9 +380,9 @@ Key decisions:
 | Decision | Typical | Why it matters |
 |---|---|---|
 | Vocab size | 32k–256k | A trade-off, not a free win: a larger vocab means fewer tokens per document, but a bigger embedding/output matrix, more FLOPs per token in the LM head, and rarer per-token updates. Modern models trend larger (128k+). |
-| Pre-tokenization regex | GPT-4 style split | Controls whether digits, whitespace and punctuation can merge into words. Splitting digits individually (or in groups of 3) measurably improves arithmetic. |
+| Pre-tokenization regex | GPT-4 style split | Controls whether digits, whitespace and punctuation can merge into words. Number-tokenization scheme measurably affects arithmetic performance — LLaMA and PaLM use single-digit tokens, GPT-3.5/4 use multi-digit tokens, and the choice interacts with reasoning accuracy ([Singh & Strouse, 2024](https://arxiv.org/abs/2402.14903)). |
 | Whitespace handling | Leading-space attached | `" the"` and `"the"` are different tokens — a classic source of prompt-sensitivity bugs. |
-| Training corpus for the tokenizer | Sample of the real mix | A tokenizer trained on English-only text makes other languages 2–4× more expensive in tokens. |
+| Training corpus for the tokenizer | Sample of the real mix | A tokenizer trained mainly on English can make other languages several times more expensive in tokens — up to 15× in one cross-lingual study of production tokenizers ([Petrov et al., 2023](https://arxiv.org/abs/2305.15425)). |
 | Special tokens | BOS/EOS/separator, reserved slots | Reserve spare slots up front; adding tokens later means resizing embeddings. |
 
 **Metric to know:** *fertility* = tokens per word (or per byte). Compare
@@ -457,13 +468,15 @@ Variants, in the order they were adopted:
 
 - **MHA** (multi-head): `n_heads` separate Q, K, V projections.
 - **MQA** (multi-query): one shared K/V head. Shrinks the KV cache ~`n_heads`×,
-  but can degrade quality relative to MHA under the same training.
+  but can degrade quality relative to MHA under the same training
+  ([Shazeer, 2019](https://arxiv.org/abs/1911.02150)).
 - **GQA** (grouped-query): `n_kv_heads` groups, e.g. 8 KV heads for 64 Q heads.
   An intermediate trade-off between MHA and MQA, and the most common choice in
-  open dense models: close to MHA quality at close to MQA cache size.
+  open dense models: close to MHA quality at close to MQA cache size
+  ([Ainslie et al., 2023](https://arxiv.org/abs/2305.13245)).
 - **MLA** (multi-head latent attention, DeepSeek): compress K/V into a
   low-rank latent, cache the latent. DeepSeek reports a smaller cache than GQA
-  at better quality.
+  at better quality ([DeepSeek-AI, 2024](https://arxiv.org/abs/2405.04434)).
 
 The KV cache is an *inference* concern, but it constrains *pretraining*
 architecture choices, because you must serve what you train.
@@ -538,11 +551,14 @@ Current practice:
 
 - **RoPE** (rotary): rotate Q and K by position-dependent angles, so their dot
   product depends on the two positions only through their *difference* (it still
-  depends on the content of Q and K, of course). Dominant choice. The `theta`
-  base (10000 originally, often 500k+ for long-context models) sets the
-  wavelength range.
-- **ALiBi**: a linear distance penalty added to attention scores. Simple,
-  extrapolates, largely superseded.
+  depends on the content of Q and K, of course) ([Su et al., 2021](https://arxiv.org/abs/2104.09864)).
+  Dominant choice. The `theta` base (10000 originally, often 500k+ for
+  long-context models) sets the wavelength range.
+- **ALiBi**: a linear distance penalty added to attention scores
+  ([Press et al., 2021](https://arxiv.org/abs/2108.12409)). Simple,
+  extrapolates well to longer sequences than trained on, but has been
+  outperformed by RoPE variants at matched training length in later
+  comparisons (e.g. [Kazemnejad et al., 2023](https://arxiv.org/abs/2305.19466)).
 - **NoPE**: no positional encoding at all — causal masking alone leaks position.
   Works surprisingly well; appears in hybrid layer schemes.
 
@@ -553,21 +569,29 @@ SwiGLU(x) = ( Swish(x W_gate) ⊙ (x W_up) ) W_down
 ```
 
 Gated activations such as SwiGLU/GeGLU commonly outperform plain GELU at a
-comparable parameter budget and are the usual choice in modern LLMs — though not
-the only good one: `modded-nanogpt` ([Part 15](#15-open-source-repositories))
-uses ReLU². Because the gate
-adds a third matrix, the hidden dimension is set to `(8/3)·d_model` rounded to a
+comparable parameter budget in Shazeer's original ablations
+([Shazeer, 2020](https://arxiv.org/abs/2002.05202)), and are the usual choice in
+modern LLMs — though not the only good one: `modded-nanogpt`
+([Part 15](#15-open-source-repositories)) uses ReLU². Because the gate adds a
+third matrix, the hidden dimension is set to `(8/3)·d_model` rounded to a
 hardware-friendly multiple, keeping the parameter count comparable to a `4·d_model`
-GELU MLP.
+GELU MLP — this is the convention PaLM and Llama use, not a property of SwiGLU
+itself.
 
 ### 5.4 Normalization
 
-**RMSNorm** is the dominant choice in modern decoder-only LLMs: `x / rms(x) · g`, no mean
-subtraction, no bias. Cheaper and empirically equivalent. Related tricks:
+**RMSNorm** is the dominant choice in modern decoder-only LLMs: `x / rms(x) · g`,
+no mean subtraction, no bias. Cheaper than LayerNorm and reported as empirically
+equivalent by its authors ([Zhang & Sennrich, 2019](https://arxiv.org/abs/1910.07467)).
+Related tricks:
 
-- **QK-norm:** normalize Q and K before the dot product. A strong stabilizer for
-  large runs; increasingly standard.
+- **QK-norm:** normalize Q and K before the dot product. Documented as an
+  effective stabilizer at scale in reproduced training-instability studies
+  ([Wortsman et al., 2023](https://arxiv.org/abs/2309.14322)); increasingly
+  standard.
 - **Logit soft-capping / z-loss:** keep output logits from drifting large.
+  PaLM's z-loss (`10⁻⁴ · log²Z`) is the widely-cited instance
+  ([Chowdhery et al., 2022](https://arxiv.org/abs/2204.02311)).
 
 Biases are generally removed from all linear layers — they cost parameters and
 slightly hurt stability.
@@ -583,10 +607,13 @@ capacity with memory instead of compute.
 The hard part is **load balancing** — routers collapse onto a few experts. Two
 approaches:
 
-1. An auxiliary balancing loss added to the objective (classic; interferes with
-   the language-modeling gradient).
+1. An auxiliary balancing loss added to the objective (classic, e.g.
+   [Zoph et al., 2022](https://arxiv.org/abs/2202.08906); interferes with the
+   language-modeling gradient).
 2. Loss-free balancing: a per-expert bias on the routing scores, adjusted
-   online to equalize load (DeepSeek-V3). Cleaner gradients.
+   online to equalize load, introduced with DeepSeek-V3
+   ([Wang et al., 2024](https://arxiv.org/abs/2408.15664);
+   [DeepSeek-AI, 2024](https://arxiv.org/abs/2412.19437)). Cleaner gradients.
 
 MoE is now standard at frontier scale. Learn dense first — everything about MoE
 is a modification of it.
@@ -602,8 +629,10 @@ For a dense model, given a parameter budget:
   64–128 so tensor cores and tensor parallelism divide cleanly. The exact
   requirement depends on dtype, GPU generation and TP degree; small dimensions
   like `d_head` just need to suit the attention kernel (64 or 128).
-- Tied vs. untied input/output embeddings: tying saves `V·d_model` parameters and
-  helps small models; large models usually untie.
+- Tied vs. untied input/output embeddings: tying saves `V·d_model` parameters
+  and was shown to help small models by Press & Wolf
+  ([2016](https://arxiv.org/abs/1608.05859)); large models usually untie, since
+  the saving is a shrinking fraction of `N` as `d_model` grows.
 
 Non-embedding parameter count for a dense SwiGLU model:
 
@@ -723,7 +752,8 @@ broken — this is the cheapest sanity check in pretraining.
 
 ### 7.1 The optimizer
 
-**AdamW**, essentially universally. Standard hyperparameters for LLM pretraining:
+**AdamW** remains the standard baseline for LLM pretraining (newer optimizers are
+discussed at the end of this section). Its usual hyperparameters:
 
 ```python
 optimizer = torch.optim.AdamW(
@@ -736,8 +766,10 @@ optimizer = torch.optim.AdamW(
 )
 ```
 
-- `β₂ = 0.95` (rather than 0.999) shortens the second-moment window, which
-  improves responsiveness and stability at large batch sizes.
+- `β₂ = 0.95` (rather than 0.999) shortens the second-moment window from ~1,000
+  steps to ~20, so the optimizer adapts faster when gradient scale shifts. It has
+  been the common LLM setting since GPT-3 (Brown et al., 2020) and is generally
+  credited with fewer loss spikes at large batch sizes.
 - **Weight decay applies to matrices, not to norms and biases.** The usual
   implementation splits on `dim >= 2`. Note what that rule actually does:
   `nn.Embedding.weight` is 2-D, so it *is* decayed — nanoGPT and many production
@@ -883,9 +915,10 @@ You cannot tune hyperparameters at target scale. Two strategies:
 - **Empirical scaling of HPs:** fit `lr*(N)` from a sweep at several small sizes
   and extrapolate. LR typically decreases roughly as a power of `N`.
 - **μP (maximal update parametrization):** reparametrize initialization and
-  per-layer learning rates so that the optimal LR is *invariant* to width. Tune
-  on a 40M model, transfer the LR to a 40B model. Real, used in production, and
-  worth understanding even if you don't adopt it.
+  per-layer learning rates so that the optimal LR is *invariant* to width
+  ([Yang et al., 2022](https://arxiv.org/abs/2203.03466)). Tune on a 40M model,
+  transfer the LR to a 40B model. Real, used in production, and worth
+  understanding even if you don't adopt it.
 
 ### Checkpoint 7
 
@@ -907,8 +940,17 @@ L(N, D) = E + A/N^α + B/D^β
 ```
 
 `E` is the irreducible entropy of the text. The two terms are the penalties for
-finite model size and finite data. Fitted exponents land near `α ≈ 0.34`,
-`β ≈ 0.28`.
+finite model size and finite data. This is the Chinchilla parametric fit; its
+published exponents land near `α ≈ 0.34`, `β ≈ 0.28`
+([Hoffmann et al., 2022](https://arxiv.org/abs/2203.15556)). An independent
+reanalysis of the same underlying data questioned some of the original paper's
+confidence intervals and one of its three estimation methods, while broadly
+supporting the tokens-scale-with-parameters conclusion
+([Besiroglu et al., 2024](https://arxiv.org/abs/2404.10102)) — a good reminder
+that even Chinchilla's own numbers carry real uncertainty. The earlier Kaplan et
+al. scaling-law paper ([2020](https://arxiv.org/abs/2001.08361)) is worth reading
+too, mainly to see why its data-scaling conclusion changed once Chinchilla
+controlled learning-rate schedule and tokenizer more carefully.
 
 ### 8.2 Chinchilla
 
@@ -925,8 +967,9 @@ setups land at different ratios. It is the right *order of magnitude* to reason
 with.
 
 This corrected the earlier Kaplan-era practice of training large models on too
-few tokens. GPT-3 is the canonical example: 175B parameters on 300B tokens, which
-is ~1.7 tokens per parameter — more than 10× under-trained by this criterion.
+few tokens. GPT-3 ([Brown et al., 2020](https://arxiv.org/abs/2005.14165)) is
+the canonical example: 175B parameters on 300B tokens, which is ~1.7 tokens per
+parameter — more than 10× under-trained by this criterion.
 
 **Worked example — spending a fixed budget.** Say you have `C = 10²¹` FLOPs. With
 the rule of thumb `D = 20N`, `C = 6N · 20N = 120N²`, so `N = √(10²¹ / 120) ≈ 2.9B`
@@ -954,10 +997,14 @@ thumb. The last row is GPT-3's ratio: clearly off the bottom of the bowl.
 ### 8.3 Why most modern models train past Chinchilla-optimal
 
 Chinchilla minimizes *training* compute. Real deployments care about *inference*
-compute, which is paid forever. A smaller model trained far past the optimal
-point — Llama-3-8B saw 15T tokens, ~1,875 tokens per parameter (counting all 8B),
-about 90× the 20-tokens/param rule of thumb — is worse per training FLOP but much
-cheaper to serve. ("90×" is the tokens-per-parameter ratio, not 90× the compute.)
+compute, which is paid forever — a case formalized for the compute-optimal
+frontier by [Hägele et al., 2024](https://arxiv.org/abs/2405.18392) and
+[Sardana et al., 2023](https://arxiv.org/abs/2401.00448) (inference-aware
+scaling laws). A smaller model trained far past the training-optimal point —
+Llama-3-8B saw 15T tokens ([Grattafiori et al., 2024](https://arxiv.org/abs/2407.21783)),
+~1,875 tokens per parameter (counting all 8B), about 90× the 20-tokens/param
+rule of thumb — is worse per training FLOP but much cheaper to serve. ("90×" is
+the tokens-per-parameter ratio, not 90× the compute.)
 
 It helps to separate three different questions people call "optimal":
 
@@ -1074,7 +1121,8 @@ Inside each node, the 8 GPUs split every weight matrix between them (TP, over
 NVLink). The lines between GPUs are that TP group; the arrows are the slower
 links between nodes.
 
-**ZeRO stages**, worth knowing precisely:
+**ZeRO stages** ([Rajbhandari et al., 2019](https://arxiv.org/abs/1910.02054)),
+worth knowing precisely:
 - Stage 1: shard optimizer states across the data-parallel ranks. Optimizer
   memory shrinks in proportion to the number of ranks. Total model-state memory
   shrinks less: the ZeRO paper quotes ~4× at large data-parallel degree under its
@@ -1105,13 +1153,21 @@ ZeRO-3 has to all-gather every layer's weights before using them.
 
 - **FlashAttention** — compute attention in tiles that fit in SRAM, never
   materializing the `T×T` matrix. Turns attention memory from `O(T²)` to `O(T)`
-  and is substantially faster. Use it (via `F.scaled_dot_product_attention` or
-  the `flash-attn` package); never hand-roll attention for a real run.
+  and is substantially faster ([Dao et al., 2022](https://arxiv.org/abs/2205.14135)).
+  Use it (via `F.scaled_dot_product_attention` or the `flash-attn` package);
+  never hand-roll attention for a real run.
 - **Activation checkpointing** — discard activations in the forward pass,
-  recompute them in the backward. Trades ~30% more compute for a large memory
-  saving. Selective checkpointing (only the cheap-to-recompute layers) is better
-  than full.
-- **`torch.compile`** — kernel fusion; often 1.2–1.8× for free.
+  recompute them in the backward. Trades extra recomputation for much lower
+  activation memory. Checkpointing everything costs roughly one extra forward
+  pass (about +33% compute, since the forward is ~⅓ of forward + backward).
+  Selective checkpointing — recomputing only the parts that are memory-heavy but
+  cheap to redo, like the attention softmax — gets most of the memory saving for
+  a small fraction of that extra compute
+  ([Korthikanti et al., 2022](https://arxiv.org/abs/2205.05198)).
+- **`torch.compile`** — fuses operations and cuts Python and kernel-launch
+  overhead. Speedups are workload- and hardware-dependent (tens of percent is
+  common), and not free: compile time at startup, recompiles when shapes change,
+  and graph breaks that are harder to debug than eager code.
 - **Overlap communication with compute** — FSDP prefetching, gradient bucketing.
   Without overlap, comms can be 30%+ of step time.
 
@@ -1131,9 +1187,10 @@ per token, left out of non-embedding `N`) and attention's `QKᵀ`/`AV` (roughly
 models or long sequences, add both terms — the Stage 11 notebook does.
 
 This makes published MFU numbers only loosely comparable: some use bare `6N`,
-PaLM's original definition adds the attention term, and some count the LM head.
-When you compare against a paper, use *its* formula — which is why Stage 11 logs
-both the bare `6N` figure and the fuller estimate.
+PaLM's original definition adds the attention term
+([Chowdhery et al., 2022](https://arxiv.org/abs/2204.02311)), and some count the
+LM head. When you compare against a paper, use *its* formula — which is why
+Stage 11 logs both the bare `6N` figure and the fuller estimate.
 
 **Worked example — MFU for the notebook's `small` run on an A100.** Say the log
 shows 300k tokens/s against the A100's 312 TFLOP/s bf16 peak:
@@ -1160,8 +1217,10 @@ so compare against runs like yours. It should be on your dashboard from step one
 
 ### 9.6 Fault tolerance
 
-At 1000+ GPUs for months, hardware *will* fail — Meta reported hundreds of
-interruptions over the Llama-3-405B run, the majority hardware-related.
+At 1000+ GPUs for months, hardware *will* fail — during one 54-day snapshot of
+the Llama-3-405B run, Meta recorded 419 unexpected interruptions, ~78% attributed
+to confirmed or suspected hardware issues (GPUs alone accounted for ~58.7% of
+all interruptions) ([Grattafiori et al., 2024](https://arxiv.org/abs/2407.21783)).
 Requirements:
 
 - Checkpoint frequently and asynchronously (write to local NVMe, upload in
@@ -1201,18 +1260,22 @@ loss jumps by 0.5–3 nats and either recovers over thousands of steps or diverg
 
 | Measure | What it does |
 |---|---|
-| QK-norm | Bounds attention logits directly. Very effective. |
-| z-loss (`10⁻⁴ · log²Z`) | Keeps the softmax normalizer near 1, preventing logit drift. |
+| QK-norm | Bounds attention logits directly. Reproduced as a very effective, cheap stabilizer in controlled small-scale instability studies ([Wortsman et al., 2023](https://arxiv.org/abs/2309.14322)). |
+| z-loss (`10⁻⁴ · log²Z`) | Keeps the softmax normalizer near 1, preventing logit drift. PaLM's own coefficient ([Chowdhery et al., 2022](https://arxiv.org/abs/2204.02311)). |
 | Lower `β₂` (0.95) | Faster adaptation to gradient-scale changes. |
-| Tuning Adam `eps` | Two *opposite* adjustments exist and get confused. **Raising** eps (say 1e-8 → 1e-6) damps updates when `v` is tiny, guarding against huge steps on near-zero gradients. **Lowering** it (1e-8 → 1e-15, as in some large-model recipes) stops eps from dominating when gradient RMS is genuinely small, which would otherwise shrink updates. Know which problem you have before changing it. |
+| Tuning Adam `eps` | Two *opposite* adjustments exist and get confused. **Raising** eps (say 1e-8 → 1e-6) damps updates when `v` is tiny, guarding against huge steps on near-zero gradients. **Lowering** it (as low as 1e-15 for some large models) prevents a specific failure Wortsman et al. document directly: at high learning rate and scale, activation RMS grows through the network, which shrinks the *incoming* gradient at each LayerNorm/RMSNorm in proportion — once that gradient RMS approaches `eps`, the update magnitude collapses and learning stalls, even though nothing has diverged. Know which problem you have before changing it. |
 | Residual-scaled init | Keeps deep residual streams bounded. |
 | Longer warmup | Cheapest fix for early-training instability. |
 | Embedding norm / logit soft-cap | Bounds the two ends of the network. |
 
-**When a spike happens anyway:** the standard playbook is to rewind to a
-checkpoint ~100–500 steps before the spike, skip the data batches involved, and
-resume (optionally at a lower LR). Spikes are frequently triggered by specific
-pathological documents — long runs of repeated characters, corrupted encodings.
+**When a spike happens anyway:** the standard playbook, as PaLM describes it, is
+to rewind to a checkpoint ~100 steps before the spike, skip the next 200–500 data
+batches, and resume
+([Chowdhery et al., 2022](https://arxiv.org/abs/2204.02311)). PaLM's own
+finding, worth knowing so you don't over-fit the story: they saw spikes even
+with clipping enabled, at irregular intervals, and traced them to specific data
+batches combined with a particular model state — not to a single class of "bad
+document" they could filter out in advance.
 
 > **Debugging heuristic:** if the loss diverges immediately, it's your LR or
 > init. If it diverges after hours of healthy training, it's data or numerics.
@@ -1263,8 +1326,11 @@ few-shot prompting:
 **Scoring detail that matters:** normalize option likelihood by token count or
 by unconditional likelihood, or you systematically favor short answers. Different
 harnesses make different choices, which is why "the same model" scores differently
-across leaderboards. Use a single harness (`lm-evaluation-harness` is standard)
-and report its settings.
+across leaderboards. Use a single harness — `lm-evaluation-harness`
+([Gao et al., 2024](https://doi.org/10.5281/zenodo.10256836)) is the de facto
+standard — and report its settings, or use a fixed-format recipe like OLMES
+([Gu et al., 2024](https://arxiv.org/abs/2406.08446)) that removes the choice
+for you.
 
 **Worked example — the normalization choice decides the answer.** Prompt: *"The
 capital of France is"*. Illustrative scores for two options:
@@ -1293,7 +1359,9 @@ settings without a single weight changing.
 ### Checkpoint 11
 
 Run `lm-evaluation-harness` on two public base models of different sizes (e.g.
-Pythia-160M and Pythia-1.4B). Reproduce the published HellaSwag numbers. Then
+Pythia-160M and Pythia-1.4B — same data, same order, 154 published checkpoints
+each, [Biderman et al., 2023](https://arxiv.org/abs/2304.01373)). Reproduce the
+published HellaSwag numbers. Then
 change the few-shot count and the normalization and see how much you can move
 the score without touching the model.
 
@@ -1391,9 +1459,10 @@ disproportionately and is increasingly treated as its own stage with its own
 data recipe, not as "the end of pretraining."
 
 **Long-context extension.** Usually done after the main run: increase RoPE
-`theta` (or apply YaRN/position interpolation), continue training on a few
-billion long-document tokens at the new context length. Cheaper and more stable
-than training long-context from scratch.
+`theta` (or apply YaRN — [Peng et al., 2023](https://arxiv.org/abs/2309.00071) —
+or position interpolation — [Chen et al., 2023](https://arxiv.org/abs/2306.15595)),
+continue training on a few billion long-document tokens at the new context
+length. Cheaper and more stable than training long-context from scratch.
 
 **Post-training.** Typically some combination of: SFT on instruction data;
 offline preference optimization (DPO and relatives — no online RL loop); and
@@ -1417,35 +1486,35 @@ Read in this order. Papers marked ★ are the ones to read fully; others you can
 skim for their core result.
 
 **Foundations**
-1. ★ *Attention Is All You Need* (2017) — the architecture.
-2. ★ *Language Models are Unsupervised Multitask Learners* (GPT-2, 2019) — the framing.
-3. *Language Models are Few-Shot Learners* (GPT-3, 2020) — scale as capability.
+1. ★ [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017) — the architecture.
+2. ★ *Language Models are Unsupervised Multitask Learners* (Radford et al., GPT-2, 2019; [PDF](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf), not on arXiv) — the framing.
+3. [*Language Models are Few-Shot Learners*](https://arxiv.org/abs/2005.14165) (Brown et al., GPT-3, 2020) — scale as capability.
 
 **Scaling**
-4. *Scaling Laws for Neural Language Models* (Kaplan et al., 2020).
-5. ★ *Training Compute-Optimal Large Language Models* (Chinchilla, 2022) — the correction.
-6. *Tensor Programs V / μTransfer* (2022) — hyperparameter transfer.
+4. [*Scaling Laws for Neural Language Models*](https://arxiv.org/abs/2001.08361) (Kaplan et al., 2020).
+5. ★ [*Training Compute-Optimal Large Language Models*](https://arxiv.org/abs/2203.15556) (Hoffmann et al., Chinchilla, 2022) — the correction. Read alongside the [replication attempt](https://arxiv.org/abs/2404.10102) (Besiroglu et al., 2024), which questions parts of its methodology.
+6. [*Tensor Programs V*](https://arxiv.org/abs/2203.03466) (Yang et al., 2022) — μTransfer, hyperparameter transfer.
 
 **Recipes (read at least two end to end)**
-7. ★ *LLaMA* and *Llama 2 / 3* papers — the canonical open recipe and its evolution.
-8. ★ *OLMo 2* — the most transparent open recipe; data, stability fixes, and ablations all published.
-9. *DeepSeek-V3* — MoE at frontier scale, MLA, fp8, loss-free balancing.
+7. ★ [*LLaMA*](https://arxiv.org/abs/2302.13971) (2023), [*Llama 2*](https://arxiv.org/abs/2307.09288) (2023), [*The Llama 3 Herd of Models*](https://arxiv.org/abs/2407.21783) (2024) — the canonical open recipe and its evolution.
+8. ★ [*2 OLMo 2 Furious*](https://arxiv.org/abs/2501.00656) (OLMo Team, 2024) — the most transparent open recipe; data, stability fixes, and ablations all published.
+9. [*DeepSeek-V3 Technical Report*](https://arxiv.org/abs/2412.19437) (DeepSeek-AI, 2024) — MoE at frontier scale, MLA, fp8, loss-free balancing.
 
 **Data**
-10. ★ *The FineWeb Datasets* (2024) — read the blog version; the best practical writeup on web data processing that exists.
-11. *DataComp-LM (DCLM)* (2024) — filtering as the dominant variable.
-12. *Deduplicating Training Data Makes Language Models Better* (2022).
-13. *The Pile* / *Dolma* — corpus construction documentation.
+10. ★ [*The FineWeb Datasets*](https://arxiv.org/abs/2406.17557) (Penedo et al., 2024) — read the blog version too; the best practical writeup on web data processing that exists.
+11. [*DataComp-LM (DCLM)*](https://arxiv.org/abs/2406.11794) (Li et al., 2024) — filtering as the dominant variable.
+12. [*Deduplicating Training Data Makes Language Models Better*](https://arxiv.org/abs/2107.06499) (Lee et al., 2021).
+13. [*The Pile*](https://arxiv.org/abs/2101.00027) (Gao et al., 2020) / [*Dolma*](https://arxiv.org/abs/2402.00159) (Soldaini et al., 2024) — corpus construction documentation.
 
 **Architecture components**
-14. *RoFormer* (RoPE), *GLU Variants Improve Transformer* (SwiGLU), *Root Mean Square Layer Normalization* (RMSNorm) — short, read all three in an hour.
-15. *GQA: Training Generalized Multi-Query Transformer Models* (2023).
+14. [*RoFormer*](https://arxiv.org/abs/2104.09864) (RoPE), [*GLU Variants Improve Transformer*](https://arxiv.org/abs/2002.05202) (SwiGLU), [*Root Mean Square Layer Normalization*](https://arxiv.org/abs/1910.07467) (RMSNorm) — short, read all three in an hour.
+15. [*GQA: Training Generalized Multi-Query Transformer Models*](https://arxiv.org/abs/2305.13245) (Ainslie et al., 2023).
 
 **Systems**
-16. ★ *FlashAttention* (and v2/v3) — the key efficiency idea.
-17. *Megatron-LM* — tensor and pipeline parallelism.
-18. *ZeRO* — memory sharding.
-19. ★ *The Ultra-Scale Playbook* (Hugging Face) — the best single practical resource on distributed training; effectively a textbook.
+16. ★ [*FlashAttention*](https://arxiv.org/abs/2205.14135) (Dao et al., 2022; v2/v3 followed) — the key efficiency idea.
+17. [*Megatron-LM*](https://arxiv.org/abs/1909.08053) (Shoeybi et al., 2019) — tensor and pipeline parallelism.
+18. [*ZeRO*](https://arxiv.org/abs/1910.02054) (Rajbhandari et al., 2019) — memory sharding.
+19. ★ *The Ultra-Scale Playbook* ([Hugging Face](https://huggingface.co/spaces/nanotron/ultrascale-playbook), not on arXiv) — the best single practical resource on distributed training; effectively a textbook.
 
 **Code to read** — see [Part 15](#15-open-source-repositories).
 
@@ -2023,7 +2092,7 @@ claims.
 
 **Goal.** A BPE tokenizer saved to disk.
 
-**What's happening.** BPE starts from bytes and repeatedly merges the most
+**What's happening.** Byte-level BPE starts from bytes and repeatedly merges the most
 frequent adjacent pair until it hits the vocab size. Train it on *your* corpus —
 a mismatched tokenizer taxes every token you will ever process
 ([Part 4](#4-tokenization)).
@@ -2293,6 +2362,9 @@ class GPT(nn.Module):
         return logits, loss
 
     def n_params(self, non_embedding=True):
+        # With tied weights the embedding table IS the LM head, so non_embedding=True
+        # drops the head too. That matches N in the 6N approximation; the head's
+        # FLOPs are added back separately in Stage 11's fuller estimate.
         n = sum(p.numel() for p in self.parameters())
         if non_embedding: n -= self.embed.weight.numel()
         return n
@@ -2622,7 +2694,9 @@ def save_ckpt(model, optimizer, step, cfg, hist, path):
                 "hist": hist,
                 "scaler": scaler.state_dict(),       # fp16 loss scale ({} if bf16)
                 # Both RNGs: harmless today (no dropout; the loader is keyed on
-                # step), required for exact resumes once you add dropout.
+                # step), needed for deterministic dropout after a resume. A fully
+                # exact resume also needs the data position (here: `step`) and
+                # deterministic kernels; multi-GPU runs need every rank's RNG too.
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": (torch.cuda.get_rng_state_all()
                              if torch.cuda.is_available() else None)}, tmp)
@@ -2630,6 +2704,8 @@ def save_ckpt(model, optimizer, step, cfg, hist, path):
     print(f"saved {path} @ step {step}")
 
 def load_ckpt(path, device):
+    # weights_only=False unpickles arbitrary Python objects (needed for cfg/hist),
+    # which can execute code. Only load checkpoints you created or trust.
     ck = torch.load(path, map_location=device, weights_only=False)
     c = Config(**ck["cfg"])
     m = GPT(c).to(device); m.load_state_dict(ck["model"])
