@@ -3191,7 +3191,11 @@ for d, L in SIZES:
         print(f"  WARNING: d={d} needs {equiv_epochs:.1f} equivalent epochs; "
               f"this point is data-limited and will sit ABOVE the true curve")
     o = make_optimizer(m, c)
-    if c.compile and device == "cuda": m = torch.compile(m)
+    # No torch.compile here. Compiled functions are cached per code object, and
+    # every new model size (and every train/eval mode switch) adds an entry; six
+    # sizes plus Stages 11-14 exhaust dynamo's limit of 8, after which it
+    # silently falls back to eager for the rest (seen in a real run). These
+    # models are tiny, so compile time would cost more than it saves anyway.
     m.train()
     for step in range(c.max_steps):
         for g in o.param_groups: g["lr"] = lr_at(step, c)
