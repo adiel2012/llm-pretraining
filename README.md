@@ -2055,7 +2055,9 @@ ROWS      = NUM_PERM // BANDS
 THRESHOLD = (1 / BANDS) ** (1 / ROWS)      # steepest point of the S-curve: ~0.71
 JACCARD_MIN = 0.7      # cutoff on the ESTIMATED Jaccard (fraction of matching
                        # signature entries) -- not exact; with 128 permutations
-                       # the standard error is ~0.04 at s=0.7
+                       # the standard error is ~0.04 at s=0.7. (LSH only proposes
+                       # candidates; on a corpus this small you could confirm each
+                       # candidate with the exact shingle-set Jaccard instead.)
 
 rng = np.random.default_rng(cfg.seed)
 # Work in the field Z_p with p = 2**31 - 1 (a Mersenne prime). Then a, b, h are
@@ -2115,6 +2117,9 @@ if dup_of:                       # always eyeball a matched pair
 # unshuffled list into train/val would let that order leak into which
 # documents land on which side of the split. `random`, not np.random, to
 # match the seed type Stage 1 already uses everywhere else in the notebook.
+# (A seeded shuffle is enough for a corpus fixed once. Large, evolving corpora
+# usually assign the split by a hash of each document's content instead, so
+# documents keep their split as new data arrives.)
 rng_split = random.Random(cfg.seed)
 shuffled = deduped[:]
 rng_split.shuffle(shuffled)
@@ -2267,8 +2272,7 @@ meta = json.load(open(f"{cfg.data_dir}/train_meta.json"))
 # offsets WITH replacement, so this is how many token-exposures the run makes
 # relative to the corpus size, not a count of sequential passes through it.
 equiv_epochs = TOKENS_PER_STEP * cfg.max_steps / meta["n_tokens"]
-print(f"\nthis run samples the equivalent of {equiv_epochs:.2f} passes over "
-      f"the training data")
+print(f"\ntraining exposure: {equiv_epochs:.2f} equivalent token epochs")
 ```
 
 **Verify.** Decode the first 200 tokens of `train.bin` (using `token_dtype`, not
@@ -2736,6 +2740,8 @@ for step in range(start_step, cfg.max_steps):
     # `hist["val"][-1]` right after appending it in the block above, which
     # silently mis-attributed the eval to the wrong step whenever eval_every
     # wasn't a multiple of 10.)
+    t_pause = time.time()      # eval and checkpoint I/O are NOT training work:
+                               # excluded from the throughput timer at the end of the loop body
     if step % cfg.eval_every == 0 and step > start_step:
         v = estimate_loss(model, val_loader)
         hist["val_step"].append(step); hist["val_loss"].append(v)
@@ -2752,6 +2758,9 @@ for step in range(start_step, cfg.max_steps):
     if step + 1 == STABLE_END:      # last stable step done; next one starts decay
         save_ckpt(model, optimizer, step + 1, cfg, hist, f"{cfg.out_dir}/stable_end.pt")
         print(f"  >>> saved stable-phase checkpoint (decay starts at step {step + 1})")
+
+    t0 += time.time() - t_pause    # shift the timer past eval/checkpoint time, so
+                                   # tok/s and MFU show no artificial dips there
 
 save_ckpt(model, optimizer, cfg.max_steps, cfg, hist, f"{cfg.out_dir}/final.pt")
 ```
@@ -2848,9 +2857,12 @@ def load_ckpt(path, device):
 # Cell 12b — prove the round trip actually works
 m2, o2, s2, c2, h2 = load_ckpt(f"{cfg.out_dir}/final.pt", device)
 xb, yb = val_loader.get_batch(0, device)
+was_training = model.training
+model.eval(); m2.eval()      # deterministic mode, so this stays valid if dropout is added
 with torch.no_grad():
     _, l1 = model(xb, yb)
     _, l2 = m2(xb, yb)
+model.train(was_training)
 print(f"reloaded {l2.item():.6f} vs original {l1.item():.6f}  (step {s2})")
 assert abs(l1.item() - l2.item()) < 1e-3, "checkpoint round-trip is broken"
 
@@ -2885,7 +2897,7 @@ continue from that loss rather than jumping back up. Delete `last.pt` to start
 fresh. (Stage 14 needs `train_docs`, `val_docs` and `quality_signals`, which
 only exist in memory, so it still requires Stages 2–6 in the same session. Those
 stages are deterministic —
-`blake2b`, not `hash()` — so re-running them reproduces the same shards.)
+`blake2b`, not `hash()` — so re-running them reproduces the same token files.)
 
 **Breaks like this.** Saving `torch.compile`'s wrapper, which prefixes every key
 with `_orig_mod.`. Saving the model but not the optimizer, which throws away the
@@ -2915,7 +2927,11 @@ val_meta = json.load(open(f"{cfg.data_dir}/val_meta.json"))
 
 @torch.no_grad()
 def evaluate_corpus(model, data, T, bs=4):
-    """One pass over the WHOLE token array in non-overlapping windows.
+    """Score every target token once, in non-overlapping BLOCKS of length T.
+    Context is reset at each block boundary: a token at position 700 is predicted
+    from tokens 512..699, not from 0..699. That is the standard fixed-block
+    convention; it slightly overestimates the loss compared with sliding-window
+    evaluation (stride < T, scoring only the new targets), which is costlier.
     Returns (sum of NLL in nats over CONTENT targets, number of such targets).
     Targets equal to EOT are masked out: the injected separators have no bytes,
     so their loss must not enter a bits-per-BYTE numerator. (`estimate_loss`
@@ -2923,8 +2939,9 @@ def evaluate_corpus(model, data, T, bs=4):
     EOT included, and may measure some tokens twice and others never.)"""
     net = getattr(model, "_orig_mod", model)        # uncompiled: window shapes vary
     was_training = net.training; net.eval()
-    t = torch.from_numpy(np.asarray(data, dtype=np.int64))
-    n = t.numel() - 1                                # number of (input, target) pairs
+    # `data` stays a memmap; only the window being scored is converted to int64.
+    a64 = lambda lo, hi: torch.from_numpy(np.asarray(data[lo:hi], dtype=np.int64))
+    n = len(data) - 1                                # number of (input, target) pairs
     nll, cnt = 0.0, 0
 
     def run(x, y):
@@ -2938,19 +2955,21 @@ def evaluate_corpus(model, data, T, bs=4):
     starts = list(range(0, n - T + 1, T))            # full windows
     for b in range(0, len(starts), bs):
         idx = starts[b:b + bs]
-        a, c = run(torch.stack([t[s:s + T]         for s in idx]),
-                   torch.stack([t[s + 1:s + T + 1] for s in idx]))
+        a, c = run(torch.stack([a64(s, s + T)         for s in idx]),
+                   torch.stack([a64(s + 1, s + T + 1) for s in idx]))
         nll += a; cnt += c
     tail = (starts[-1] + T) if starts else 0
     if tail < n:                                     # shorter remainder window
-        a, c = run(t[tail:n][None], t[tail + 1:n + 1][None])
+        a, c = run(a64(tail, n)[None], a64(tail + 1, n + 1)[None])
         nll += a; cnt += c
     net.train(was_training)
     return nll, cnt
 
 nll, n_eval = evaluate_corpus(model, val_loader.data, cfg.seq_len)
 # Every content token is scored except the file's very first (no context to
-# predict it from), so n_eval should equal n_content_tokens - 1.
+# predict it from), so n_eval should equal n_content_tokens - 1. Its bytes are
+# still in n_bytes, so BPB differs from exact corpus BPB by one token's worth --
+# negligible for any real validation set.
 assert abs(n_eval - val_meta["n_content_tokens"]) <= 1, (n_eval, val_meta)
 val_loss = nll / n_eval                              # nats per content token
 bpb = nll / (math.log(2) * val_meta["n_bytes"])      # total content NLL / total bytes
