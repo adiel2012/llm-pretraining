@@ -121,7 +121,7 @@ not a guarantee: the further you extrapolate, the more a change in data, recipe 
 batch regime can bend the curve. Still, this is why pretraining is an
 engineering discipline and not alchemy — you de-risk at small scale.
 
-**4. Data quality moves the curve, not just the point.** Better data doesn't only
+**4. Data quality can move the curve, not just the point.** Better data doesn't only
 give a lower loss at the same compute; it changes the slope of what you get per
 FLOP on downstream tasks. Improvements in data curation, filtering,
 deduplication and mixture design have plausibly mattered as much as any single
@@ -140,7 +140,7 @@ flowchart TD
     B --> C["Deduplication<br/>MinHash LSH, exact substring"]
     C --> D["Decontamination<br/>remove eval-set overlap"]
     D --> E["Mixing<br/>web / code / math / books, with weights"]
-    E --> F["Tokenization<br/>BPE → uint16/uint32 token shards"]
+    E --> F["Tokenization<br/>BPE → uint16/uint32 tokenized binary data"]
     F --> G
     subgraph G["Training loop — repeated ~10⁵–10⁶ times"]
         direction LR
@@ -2389,7 +2389,11 @@ class RMSNorm(nn.Module):
         return (x * self.g.float()).to(dt)
 
 def build_rope(head_dim, max_len, theta, device):
-    inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    assert head_dim % 2 == 0, "RoPE rotates PAIRS of dimensions"
+    half = head_dim // 2          # one rotation frequency per (i, i+half) pair
+    # Same numbers as arange(0, head_dim, 2)/head_dim (2i/hd == i/half), written
+    # per PAIR so it visibly matches the rotate-half layout used in apply_rope.
+    inv = 1.0 / (theta ** (torch.arange(half, device=device).float() / half))
     freqs = torch.outer(torch.arange(max_len, device=device).float(), inv)
     return torch.cos(freqs), torch.sin(freqs)          # each (max_len, hd/2)
 
@@ -2422,6 +2426,9 @@ class Attention(nn.Module):
         # RoPE before the repeat: same result either way (it acts per-head with
         # shared cos/sin), but this rotates nkv heads instead of nh of them.
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        # repeat_interleave materialises the repeated K/V: fine for clarity here,
+        # but production GQA kernels read the grouped KV heads directly, so the
+        # cache AND the attention read stay small.
         k = k.repeat_interleave(self.rep, dim=1)      # GQA: broadcast KV heads
         v = v.repeat_interleave(self.rep, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # FlashAttention
@@ -2483,11 +2490,15 @@ class GPT(nn.Module):
         return logits, loss
 
     def n_params(self, non_embedding=True):
-        # With tied weights the embedding table IS the LM head, so non_embedding=True
-        # drops the head too. That matches N in the 6N approximation; the head's
-        # FLOPs are added back separately in Stage 11's fuller estimate.
+        # N excludes BOTH the token embedding and the vocabulary output projection
+        # (the head's FLOPs are added back in Stage 11's fuller estimate). With tied
+        # weights they are one Parameter, so subtracting the embedding removes both;
+        # untied, the head is a separate matrix and must be subtracted as well.
         n = sum(p.numel() for p in self.parameters())
-        if non_embedding: n -= self.embed.weight.numel()
+        if non_embedding:
+            n -= self.embed.weight.numel()
+            if not self.cfg.tie_embeddings:
+                n -= self.head.weight.numel()
         return n
 
 model = GPT(cfg).to(device)
@@ -2789,8 +2800,9 @@ save_ckpt(model, optimizer, cfg.max_steps, cfg, hist, f"{cfg.out_dir}/final.pt")
 **Predict before you run.** Before the first step prints: what loss do you expect
 at step 10, and at step 100? (Step ~0 should be near `ln V`; within a hundred
 steps a working model is at or below unigram entropy, roughly 5–6 nats for
-English.) Also guess your MFU. Most people guess far too high on a small model —
-at `d_model=512` you are launch-latency bound, and 15–25% is normal.
+English.) Also guess your MFU. It depends strongly on model size and hardware: the
+`small` preset may reach roughly 15–25% on suitable hardware, while `tiny` gets
+only a few percent because kernel-launch and framework overhead dominate.
 
 **Verify.** Watch these four, in this order of importance:
 
@@ -2987,7 +2999,8 @@ nll, n_eval = evaluate_corpus(model, val_loader.data, cfg.seq_len)
 # predict it from), so n_eval should equal n_content_tokens - 1. Its bytes are
 # still in n_bytes, so BPB differs from exact corpus BPB by one token's worth --
 # negligible for any real validation set.
-assert abs(n_eval - val_meta["n_content_tokens"]) <= 1, (n_eval, val_meta)
+expected = val_meta["n_content_tokens"] - 1      # exactly one token is unscored
+assert n_eval == expected, (n_eval, expected, val_meta)
 val_loss = nll / n_eval                              # nats per content token
 bpb = nll / (math.log(2) * val_meta["n_bytes"])      # total content NLL / total bytes
 print(f"val loss {val_loss:.4f} | ppl {math.exp(val_loss):.2f} | BPB {bpb:.4f}")
@@ -3162,6 +3175,14 @@ de-risk expensive runs by forecasting them from cheap ones
 ([Part 8](#8-scaling-laws)). Doing it once at notebook scale makes every scaling
 discussion afterwards concrete.
 
+**A simplification to keep in mind.** Every size trains at the *same* peak
+learning rate (the preset's), although the best LR shifts with width
+([Part 7.5](#75-hyperparameter-transfer)). So this experiment is illustrative,
+not a rigorous scaling-law measurement: the wider models are probably a little
+under-tuned, which biases `alpha`. A proper study would tune or scale the LR per
+size (or use μP). Each model does get its own seed and loss scaler, so re-running
+one size reproduces it.
+
 ```python
 # Cell 15 — mini scaling law
 from scipy.optimize import curve_fit
@@ -3182,7 +3203,11 @@ for d, L in SIZES:
     n_kv = 2 if n_head % 2 == 0 else 1
     c = Config(**{**PRESETS[PRESET], "d_model": d, "n_layer": L,
                   "n_head": n_head, "n_kv_head": n_kv})
+    torch.manual_seed(cfg.seed + d)     # per-size seed: re-running one size reproduces it
     m = GPT(c).to(device); n = m.n_params()
+    # Each model gets its OWN loss scaler; sharing Stage 11's would carry its
+    # scale history into an unrelated model.
+    run_scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and not use_bf16))
     tps = c.batch_size * c.grad_accum * c.seq_len
     c.max_steps = max(200, round(TOK_PER_PARAM * n / tps))   # compute-matched
     equiv_epochs = c.max_steps * tps / train_tokens   # equivalent, not literal --
@@ -3202,10 +3227,10 @@ for d, L in SIZES:
         for micro in range(c.grad_accum):
             xb, yb = train_loader.get_batch(step * c.grad_accum + micro, device)
             with autocast: _, loss = m(xb, yb)
-            scaler.scale(loss / c.grad_accum).backward()
-        scaler.unscale_(o)
+            run_scaler.scale(loss / c.grad_accum).backward()
+        run_scaler.unscale_(o)
         torch.nn.utils.clip_grad_norm_(m.parameters(), c.grad_clip)
-        scaler.step(o); scaler.update(); o.zero_grad(set_to_none=True)
+        run_scaler.step(o); run_scaler.update(); o.zero_grad(set_to_none=True)
     v = estimate_loss(m, val_loader, 30)
     results.append((n, v))
     print(f"N={n/1e6:6.2f}M  steps={c.max_steps:5d}  "
