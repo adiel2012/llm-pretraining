@@ -71,7 +71,10 @@ heavy lifting.
 C ≈ 6 · N · D        FLOPs
 ```
 
-where `N` = non-embedding parameters, `D` = training tokens. The 6 comes from
+where `N` = transformer-body parameters (everything except the token embedding
+table and the vocabulary-output projection — "non-embedding" for short, though
+that output projection is a matrix, not an embedding table; see the worked
+example below), `D` = training tokens. The 6 comes from
 2 FLOPs per multiply-accumulate × 3 passes (forward, backward w.r.t. inputs,
 backward w.r.t. weights). Every architectural or data decision is really a
 question of *how to spend a fixed C*.
@@ -94,9 +97,11 @@ recomputation from activation checkpointing. For large models the error is small
 for small models or long contexts it is not ([Part 9.5](#95-mfu--the-number-that-matters)
 shows by how much).
 
-Now scale it to Llama-3-8B, trained on 15T tokens. Its "8B" includes two
-128,256 × 4,096 embedding tables (input and untied output, ~0.5B each), so by
-this guide's definition `N ≈ 7.0B`:
+Now scale it to Llama-3-8B, trained on 15T tokens. Its "8B" includes the
+128,256 × 4,096 input embedding table *and* the same-sized output projection
+(the LM head — Llama-3 untied it from the embedding, so it's a second matrix of
+that shape, not a second "embedding table"), ~0.5B parameters each. Excluding
+both, by this guide's definition, gives `N ≈ 7.0B`:
 
 ```
 C = 6 × 7.0e9 × 15e12            ≈ 6.3e23 FLOPs
@@ -118,8 +123,10 @@ engineering discipline and not alchemy — you de-risk at small scale.
 
 **4. Data quality moves the curve, not just the point.** Better data doesn't only
 give a lower loss at the same compute; it changes the slope of what you get per
-FLOP on downstream tasks. The last five years of open-model progress is more a
-data story than an architecture story.
+FLOP on downstream tasks. Improvements in data curation, filtering,
+deduplication and mixture design have plausibly mattered as much as any single
+architectural change (RoPE, GQA, SwiGLU, MoE) to recent open-model progress —
+a claim this guide leans on to justify Part 3's length, not a settled measurement.
 
 **5. At scale, the bottleneck is systems.** A 70B-parameter run is a distributed
 systems problem — memory hierarchies, collective communication, fault tolerance
@@ -421,7 +428,8 @@ obviously hurt the model.
 
 ## 5. Architecture
 
-Modern pretrained LLMs are decoder-only transformers. The 2017 design has
+Modern autoregressive LLMs such as GPT and Llama are typically decoder-only
+transformers — the scope this guide fixed in Part 1. The 2017 design has
 accumulated a specific set of changes; learn a *representative modern* stack, then
 the history.
 
@@ -436,10 +444,12 @@ flowchart LR
     P2 --> Y["x′"]
 ```
 
-Pre-norm (normalize *before* the sublayer, not after) with residual connections.
-This is what makes deep stacks trainable — the residual stream is an
-uninterrupted identity path from input to output. Each block only *adds* a
-correction to that stream; nothing overwrites it.
+Pre-norm (normalize *before* the sublayer, not after) with residual connections
+gives the residual stream an uninterrupted identity path from input to output —
+each block only *adds* a correction to that stream; nothing overwrites it. That
+is a major contributor to stable optimization of deep transformer stacks,
+alongside initialization, the learning-rate schedule and normalization details
+(Part 7) — it is not the whole story on its own.
 
 The whole model is just that block stacked `L` times between an embedding and an
 output projection:
@@ -729,11 +739,16 @@ perplexity                  exp(1.5)              = 4.48
 bits per byte               1.5 / (ln 2 × 4.2)    = 0.515
 ```
 
-Perplexity 4.48 means that on average the model is as unsure as if it were
-choosing uniformly among ~4.5 tokens — down from 16,000 at initialization. Now a
-second model with a 32k vocabulary averages 5 bytes/token and reports a *higher*
-1.7 nats/token. Its BPB is `1.7 / (ln 2 × 5) = 0.49` — it is actually the better
-model. Raw loss would have ranked them the wrong way round.
+A perplexity of 4.48 is the *effective branching factor* under the cross-entropy
+measure — down from 16,000 at initialization — not a claim that the model's
+actual next-token distribution is uniform over ~4.5 tokens; in reality it is
+peaked, and 4.48 is `e` to the power of its average entropy. Now a second model
+with a 32k vocabulary averages 5 bytes/token and reports a *higher* 1.7
+nats/token. Its BPB is `1.7 / (ln 2 × 5) = 0.49` — lower than the first model's
+0.515, on this text. Raw loss would have ranked the two models the wrong way
+round; BPB is the fairer comparison here, though "fairer" still only means
+"controls for the tokenizer on this evaluation text", not "the definitive
+verdict on which model is better overall."
 
 **Interpreting the curve.** A healthy run drops very fast for the first ~1% of
 steps (learning unigram frequencies), then settles into a near-straight line on a
@@ -1719,8 +1734,8 @@ an artifact upstream of it:
 ```mermaid
 flowchart TD
     S1["1 · Config"] -.-> S2["2 · raw documents"]
-    S2 --> S3["3 · filtered documents"] --> S4["4 · deduplicated documents"]
-    S4 --> S5["5 · tokenizer.json"]
+    S2 --> S3["3 · filtered documents"] --> S4["4 · deduped + shuffled<br/>train_docs / val_docs"]
+    S4 --> S5["5 · tokenizer.json<br/>(train_docs only)"]
     S4 --> S6["6 · train.bin / val.bin"]
     S5 --> S6
     S6 --> S7["7 · Loader: (seed, step) → batch"]
@@ -2007,12 +2022,17 @@ which the per-rule counter makes obvious, and an aggregate keep-rate would hide.
 
 ### Stage 4 — Deduplicate
 
-**Goal.** Near-duplicate documents removed.
+**Goal.** Near-duplicate documents removed, and a shuffled train/validation split
+fixed *before* anything downstream — including the tokenizer — sees it.
 
 **What's happening.** Duplicated text causes memorization and wastes compute.
 MinHash estimates Jaccard similarity between documents cheaply: shingle each doc
 into n-grams, hash them, keep the minimum hash per permutation, then band the
 signature so similar docs collide in a bucket ([Part 3.3](#33-deduplication)).
+The split happens here, not in Stage 6, for a reason: Stage 5 trains the
+tokenizer next, and a tokenizer trained on documents that end up in validation
+has a (mild, but real) form of leakage — its merges reflect vocabulary it will
+later be "tested" on.
 
 ```python
 # Cell 4 — MinHash LSH near-duplicate removal
@@ -2066,6 +2086,21 @@ if dup_of:                       # always eyeball a matched pair
     i, (j, est) = next(iter(dup_of.items()))
     print(f"\nestimated Jaccard {est:.3f}")
     print(f"DUP:\n{kept[i][:200]}\n\nORIGINAL:\n{kept[j][:200]}")
+
+# Shuffle before splitting. `docs` preserved crawl/streaming order (source,
+# time, whatever order TinyStories was written to disk in); slicing an
+# unshuffled list into train/val would let that order leak into which
+# documents land on which side of the split. `random`, not np.random, to
+# match the seed type Stage 1 already uses everywhere else in the notebook.
+rng_split = random.Random(cfg.seed)
+shuffled = deduped[:]
+rng_split.shuffle(shuffled)
+split = int(0.995 * len(shuffled))
+# Keep these named: EVERY later stage -- the tokenizer (Stage 5), the shard
+# writer (Stage 6), and the anneal corpus (Stage 14) -- must draw from
+# train_docs, never val_docs.
+train_docs, val_docs = shuffled[:split], shuffled[split:]
+print(f"\ntrain/val split: {len(train_docs):,} / {len(val_docs):,} docs")
 ```
 
 **Predict before you run.** With `BANDS=16` and `ROWS=8`, where is the
@@ -2084,7 +2119,8 @@ documents. Silent integer overflow: drawing `A` up to 2⁶¹ (as `datasketch` do
 with 32-bit hashes makes `A*h` exceed uint64 and wrap before the modulus applies,
 so "mod p" is not what runs. That is why this cell draws `A` and `B` below 2³¹.
 It is mostly harmless in practice, but it means the code is not doing what it
-claims.
+claims. Splitting *after* shuffling, but training the tokenizer on the
+unsplit corpus — the bug this cell's ordering exists to avoid.
 
 ---
 
@@ -2095,7 +2131,8 @@ claims.
 **What's happening.** Byte-level BPE starts from bytes and repeatedly merges the most
 frequent adjacent pair until it hits the vocab size. Train it on *your* corpus —
 a mismatched tokenizer taxes every token you will ever process
-([Part 4](#4-tokenization)).
+([Part 4](#4-tokenization)). Train it on `train_docs` specifically, not the
+full `deduped` set — Stage 4 already split them for exactly this reason.
 
 ```python
 # Cell 5 — BPE tokenizer
@@ -2116,14 +2153,16 @@ trainer = trainers.BpeTrainer(vocab_size=cfg.vocab_size,
                               special_tokens=SPECIALS,
                               initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
                               show_progress=True)
-tok.train_from_iterator(deduped, trainer=trainer, length=len(deduped))
+tok.train_from_iterator(train_docs, trainer=trainer, length=len(train_docs))
 tok.save(f"{cfg.data_dir}/tokenizer.json")
 
 EOT = tok.token_to_id("<|endoftext|>")
-assert tok.get_vocab_size() <= 65535, "vocab > uint16; use uint32 in Stage 6"
+# Stage 6 picks uint16 vs uint32 from this number automatically; this assert
+# just fails loudly and immediately if a vocab_size change breaks that.
+assert tok.get_vocab_size() <= 2**32 - 1, "vocab size doesn't fit in uint32"
 
 # fertility = tokens per word: the number that decides your effective compute
-sample = deduped[:2000]
+sample = train_docs[:2000]
 n_tok = sum(len(tok.encode(d).ids) for d in sample)
 n_word = sum(len(d.split()) for d in sample)
 print(f"vocab={tok.get_vocab_size()}  fertility={n_tok/n_word:.3f} tok/word")
@@ -2136,59 +2175,73 @@ English. Look at the printed token list — digits should be split sensibly.
 
 **Breaks like this.** Forgetting to reserve special-token slots (adding them
 later means resizing embeddings); training the tokenizer on unfiltered data so
-merges are spent on junk.
+merges are spent on junk; training it on `deduped` instead of `train_docs`,
+which quietly reintroduces the leakage Stage 4 split to avoid.
 
 ---
 
 ### Stage 6 — Tokenize to shards
 
-**Goal.** `train.bin` and `val.bin` — flat `uint16` token arrays.
+**Goal.** `train.bin` and `val.bin` — flat token-id arrays, written incrementally.
 
 **What's happening.** Training reads tokens millions of times, so you tokenize
 once, up front, into a flat binary file that can be memory-mapped. Documents are
 concatenated with an end-of-text token between them ([Part 3.6](#36-practical-shape-of-the-data-pipeline)).
+`train_docs`/`val_docs` already exist from Stage 4 — this stage only encodes
+them, it does not decide the split.
 
 ```python
 # Cell 6 — tokenize to flat binary
 from tqdm.auto import tqdm
 
-split = int(0.995 * len(deduped))
-# Keep these named: EVERY later stage must draw from train_docs, never val_docs.
-train_docs, val_docs = deduped[:split], deduped[split:]
-splits = {"train": train_docs, "val": val_docs}
+# uint16 covers vocab_size up to 65,536; fall back to uint32 automatically
+# instead of hardcoding uint16 and hoping nobody raises vocab_size past it.
+token_dtype = np.uint16 if tok.get_vocab_size() <= 65_536 else np.uint32
 
+splits = {"train": train_docs, "val": val_docs}
 CHUNK = 10_000
 for name, docs_split in splits.items():
     path = f"{cfg.data_dir}/{name}.bin"
-    ids_all, n_content = [], 0
-    # Chunk the encoding so the progress bar tracks the slow part. Wrapping
-    # tqdm around a finished encode_batch() would measure nothing.
-    for s in tqdm(range(0, len(docs_split), CHUNK), desc=name):
-        for enc in tok.encode_batch(docs_split[s:s+CHUNK]):
-            ids_all.append(np.array(enc.ids + [EOT], dtype=np.uint16))
-            n_content += len(enc.ids)          # content tokens, excluding EOT
-    arr = np.concatenate(ids_all)
-    arr.tofile(path)
+    n_tokens, n_content = 0, 0
+    # Write each chunk straight to disk instead of collecting every chunk into
+    # one Python list and concatenating at the end -- that pattern is fine at
+    # TinyStories scale, but it means holding the entire split in RAM twice
+    # (the list of arrays, then the concatenated array). Streaming to the file
+    # is the shape a real, much-larger pipeline actually takes (Part 3.6).
+    with open(path, "wb") as fh:   # not `f` -- that name is used elsewhere for FLOPs
+        for s in tqdm(range(0, len(docs_split), CHUNK), desc=name):
+            for enc in tok.encode_batch(docs_split[s:s+CHUNK]):
+                ids = np.array(enc.ids + [EOT], dtype=token_dtype)
+                fh.write(ids.tobytes())
+                n_tokens += ids.size
+                n_content += len(enc.ids)      # content tokens, excluding EOT
     n_bytes = sum(len(d.encode("utf-8")) for d in docs_split)
-    json.dump({"n_tokens": int(arr.size),      # includes one EOT per document
-               "n_content_tokens": int(n_content),   # use THIS for BPB
-               "n_bytes": n_bytes},
+    json.dump({"n_tokens": n_tokens,           # includes one EOT per document
+               "n_content_tokens": n_content,  # use THIS for BPB
+               "n_bytes": n_bytes,
+               "dtype": token_dtype.__name__}, # Stage 7's Loader reads this back
               open(f"{cfg.data_dir}/{name}_meta.json", "w"))
-    print(f"{name}: {arr.size/1e6:.2f}M tokens -> {path}")
+    print(f"{name}: {n_tokens/1e6:.2f}M tokens ({token_dtype.__name__}) -> {path}")
 
 meta = json.load(open(f"{cfg.data_dir}/train_meta.json"))
-epochs = TOKENS_PER_STEP * cfg.max_steps / meta["n_tokens"]
-print(f"\nthis run will make {epochs:.2f} passes over the training data")
+# "Equivalent" epochs, not literal ones: Stage 7's loader samples random
+# offsets WITH replacement, so this is how many token-exposures the run makes
+# relative to the corpus size, not a count of sequential passes through it.
+equiv_epochs = TOKENS_PER_STEP * cfg.max_steps / meta["n_tokens"]
+print(f"\nthis run samples the equivalent of {equiv_epochs:.2f} passes over "
+      f"the training data")
 ```
 
-**Verify.** Decode the first 200 tokens of `train.bin` and confirm it reads as
-text with `<|endoftext|>` at document boundaries. Check the epoch count: more
-than ~4 passes gives diminishing returns ([Part 3.5](#35-mixing)) — get more data
-or fewer steps.
+**Verify.** Decode the first 200 tokens of `train.bin` (using `token_dtype`, not
+a hardcoded `np.uint16`) and confirm it reads as text with `<|endoftext|>` at
+document boundaries. Check `equiv_epochs`: more than ~4 gives diminishing
+returns ([Part 3.5](#35-mixing)) — get more data or fewer steps.
 
-**Breaks like this.** `uint16` overflow with a vocab above 65535 (the assert in
-Stage 5 catches it); forgetting the separator token, so the model learns to run
-documents together.
+**Breaks like this.** Hardcoding `np.uint16` for both writing and reading, so a
+later vocab-size increase past 65,536 silently wraps token ids instead of
+failing loudly — this is exactly why `token_dtype` is computed once here and
+threaded through the meta file to Stage 7. Forgetting the separator token, so
+the model learns to run documents together.
 
 ---
 
@@ -2205,8 +2258,12 @@ the RNG on the global step makes the whole data order a pure function of
 ```python
 # Cell 7 — memmap dataloader
 class Loader:
-    def __init__(self, path, batch_size, seq_len, seed=0):
-        self.data = np.memmap(path, dtype=np.uint16, mode="r")
+    def __init__(self, path, batch_size, seq_len, seed=0, dtype=np.uint16):
+        # dtype must match what Stage 6 wrote this file with, or every token
+        # id silently reads back wrong (reinterpreted at the wrong byte width)
+        # with no error. Pass the dtype through explicitly rather than
+        # hardcoding it, since Stage 6 picks uint16 vs uint32 from vocab_size.
+        self.data = np.memmap(path, dtype=dtype, mode="r")
         self.B, self.T, self.seed = batch_size, seq_len, seed
         self.n_start = len(self.data) - seq_len - 1
         assert self.n_start > 0, "corpus shorter than one sequence"
@@ -2223,8 +2280,12 @@ class Loader:
                     y.pin_memory().to(device, non_blocking=True))
         return x.to(device), y.to(device)
 
-train_loader = Loader(f"{cfg.data_dir}/train.bin", cfg.batch_size, cfg.seq_len, cfg.seed)
-val_loader   = Loader(f"{cfg.data_dir}/val.bin",   cfg.batch_size, cfg.seq_len, cfg.seed + 1)
+token_dtype  = getattr(np, meta["dtype"])   # `meta` is train_meta.json, loaded at
+                                             # the end of Stage 6; reused here.
+train_loader = Loader(f"{cfg.data_dir}/train.bin", cfg.batch_size, cfg.seq_len,
+                      cfg.seed,     dtype=token_dtype)
+val_loader   = Loader(f"{cfg.data_dir}/val.bin",   cfg.batch_size, cfg.seq_len,
+                      cfg.seed + 1, dtype=token_dtype)
 
 x, y = train_loader.get_batch(0, device)
 print(x.shape, y.shape, x.dtype)
@@ -2572,7 +2633,10 @@ def estimate_loss(net, loader, n_batches=20):
         tot += l.item()
     net.train(was_training); return tot / n_batches
 
-hist = {"step": [], "loss": [], "val": [], "lr": [], "gnorm": [], "mfu": []}
+hist = {"step": [], "loss": [], "lr": [], "gnorm": [], "mfu": [],
+        # val kept as a SEPARATE (step, loss) series, not slotted into the
+        # per-log arrays above -- see the note at the log/eval block below.
+        "val_step": [], "val_loss": []}
 start_step = 0
 
 # --- resume, if a checkpoint is already on disk ---
@@ -2582,7 +2646,11 @@ if os.path.exists(resume_path):
     print(f"resumed from step {start_step}")
 
 STABLE_END = cfg.max_steps - int(cfg.decay_frac * cfg.max_steps)
-model.train(); t0 = time.time(); last_log = start_step
+model.train(); t0 = time.time()
+last_log = start_step - 1   # so the FIRST log's step count is inclusive of
+                             # every step run since start_step, even if
+                             # start_step isn't itself a multiple of 10 (an
+                             # unusual config, but the arithmetic should hold)
 
 for step in range(start_step, cfg.max_steps):
     lr = lr_at(step, cfg)
@@ -2611,14 +2679,20 @@ for step in range(start_step, cfg.max_steps):
         l = loss_accum.item()
         hist["step"].append(step); hist["loss"].append(l)
         hist["lr"].append(lr);     hist["gnorm"].append(gnorm.item())
-        hist["mfu"].append(mfu);   hist["val"].append(None)
+        hist["mfu"].append(mfu)
         print(f"step {step:5d} | loss {l:.4f} | lr {lr:.2e} | "
               f"gnorm {gnorm.item():5.2f} | {tok_s/1e3:6.1f}k tok/s | "
               f"mfu {mfu:5.1%} (6N {mfu_6n:5.1%})")
 
+    # val is its OWN (step, loss) series -- not "the most recently logged
+    # training-log entry" -- so this is correct however eval_every relates to
+    # the training-log interval of 10 above. (An earlier version overwrote
+    # `hist["val"][-1]` right after appending it in the block above, which
+    # silently mis-attributed the eval to the wrong step whenever eval_every
+    # wasn't a multiple of 10.)
     if step % cfg.eval_every == 0 and step > start_step:
         v = estimate_loss(model, val_loader)
-        hist["val"][-1] = v
+        hist["val_step"].append(step); hist["val_loss"].append(v)
         print(f"  >>> step {step}: val loss {v:.4f}  ppl {math.exp(v):.2f}")
 
     # Checkpoints store the NEXT step to run (step + 1). This step's update is
@@ -2659,7 +2733,11 @@ at `d_model=512` you are launch-latency bound, and 15–25% is normal.
 quietly costs throughput — accumulate `loss.detach()` and sync only when logging.
 Clipping *before* `scaler.unscale_()`, which clips the scaled gradients and so
 applies an arbitrary threshold. Hardcoding an H100's peak FLOPs and then
-reporting an MFU that is 15× too low on a T4.
+reporting an MFU that is 15× too low on a T4. Storing val loss as `hist["val"][-1]`
+right after appending a training-log row — correct only when `eval_every` is a
+multiple of the log interval, and silently wrong (attributed to the wrong step)
+the moment it isn't; keeping `val_step`/`val_loss` as their own series avoids
+the coupling entirely.
 
 > **On forgetting `/ cfg.grad_accum`:** it does *not* inflate your effective
 > learning rate under Adam — see the note in [Part 7.3](#73-batch-size). It
@@ -2816,8 +2894,9 @@ for p in ["Once upon a time", "The little robot"]:
 
 fig, ax = plt.subplots(1, 3, figsize=(15, 3.5))
 ax[0].plot(hist["step"], hist["loss"], lw=.8, label="train")
-vs = [(s, v) for s, v in zip(hist["step"], hist["val"]) if v is not None]
-ax[0].plot(*zip(*vs), "o-", label="val"); ax[0].set_yscale("log")
+if hist["val_step"]:
+    ax[0].plot(hist["val_step"], hist["val_loss"], "o-", label="val")
+ax[0].set_yscale("log")
 ax[0].set_title("loss"); ax[0].legend()
 ax[1].plot(hist["step"], hist["gnorm"], lw=.8); ax[1].set_title("grad norm")
 ax[2].plot(hist["step"], hist["mfu"],  lw=.8); ax[2].set_title("MFU")
@@ -2826,8 +2905,10 @@ plt.tight_layout(); plt.show()
 ```
 
 **Verify.** On TinyStories at `small`, expect val loss ~1.3–1.8 and grammatical,
-mostly-coherent stories. Degenerate repetition means undertrained or too low a
-sampling temperature.
+mostly-coherent stories. Degenerate repetition can indicate undertraining or too
+low a sampling temperature — but also data repetition, a missing/mishandled EOS
+token, or (less likely here) training instability. Check the val loss and grad
+norm history in Stage 11's plots before assuming it's the temperature.
 
 **Breaks like this.** Comparing raw loss across runs with different vocab sizes —
 always use BPB. Evaluating without `model.eval()` if you later add dropout.
@@ -2864,8 +2945,10 @@ def quality_score(d):
 DECAY_STEPS = int(cfg.decay_frac * cfg.max_steps)
 
 # Size the anneal corpus to the decay phase. A fixed 20k docs (~4M tokens) against
-# a ~59M-token decay would be ~15 epochs -- far past the ~4 in [Part 3.5] -- and
-# the arm would lose to plain repetition, not to bad data.
+# a ~59M-token decay would expose each token ~15 times over -- far past the ~4
+# in [Part 3.5] -- and the arm would lose to plain repetition, not to bad data.
+# (Sampling is random-with-replacement, so these are equivalent/expected
+# exposures, not literal sequential epochs.)
 MAX_ANNEAL_EPOCHS = 2
 decay_tokens = DECAY_STEPS * TOKENS_PER_STEP
 tok_per_doc  = meta["n_tokens"] / len(train_docs)
@@ -2876,15 +2959,16 @@ n_anneal = min(len(train_docs),
 # split and contaminate every number below.
 anneal_docs = sorted(train_docs, key=quality_score, reverse=True)[:n_anneal]
 print(f"anneal corpus: top {n_anneal:,} of {len(train_docs):,} train docs "
-      f"(~{decay_tokens / (n_anneal * tok_per_doc):.1f} epochs over the decay)")
+      f"(~{decay_tokens / (n_anneal * tok_per_doc):.1f} equivalent epochs over the decay)")
 # Compare CONTENT, not id(): an id() check is true by construction and can never
 # fail. This one catches a val document that also appears in train by text.
 assert not (set(anneal_docs) & set(val_docs)), "val leaked in"
 
-np.concatenate([np.array(e.ids + [EOT], dtype=np.uint16)
+np.concatenate([np.array(e.ids + [EOT], dtype=token_dtype)   # from Stage 6/7
                 for e in tok.encode_batch(anneal_docs)]).tofile(
                 f"{cfg.data_dir}/anneal.bin")
-anneal_loader = Loader(f"{cfg.data_dir}/anneal.bin", cfg.batch_size, cfg.seq_len, 7)
+anneal_loader = Loader(f"{cfg.data_dir}/anneal.bin", cfg.batch_size, cfg.seq_len, 7,
+                       dtype=token_dtype)
 
 def decay_from_stable(loader, tag):
     """Branch from the end of the stable phase and run the SAME decay on `loader`."""
@@ -2970,10 +3054,11 @@ for d, L in SIZES:
     m = GPT(c).to(device); n = m.n_params()
     tps = c.batch_size * c.grad_accum * c.seq_len
     c.max_steps = max(200, round(TOK_PER_PARAM * n / tps))   # compute-matched
-    epochs = c.max_steps * tps / train_tokens
-    if epochs > 4:     # [Part 3.5] -- repeated data, not model size, will set this loss
-        print(f"  WARNING: d={d} needs {epochs:.1f} epochs; this point is "
-              f"data-limited and will sit ABOVE the true curve")
+    equiv_epochs = c.max_steps * tps / train_tokens   # equivalent, not literal --
+                                                       # see Stage 6's comment
+    if equiv_epochs > 4:  # [Part 3.5] -- repeated data, not model size, will set this loss
+        print(f"  WARNING: d={d} needs {equiv_epochs:.1f} equivalent epochs; "
+              f"this point is data-limited and will sit ABOVE the true curve")
     o = make_optimizer(m, c)
     if c.compile and device == "cuda": m = torch.compile(m)
     m.train()
@@ -2989,7 +3074,7 @@ for d, L in SIZES:
     v = estimate_loss(m, val_loader, 30)
     results.append((n, v))
     print(f"N={n/1e6:6.2f}M  steps={c.max_steps:5d}  "
-          f"tokens={c.max_steps*tps/1e6:7.1f}M  epochs={epochs:4.1f}  loss={v:.4f}")
+          f"tokens={c.max_steps*tps/1e6:7.1f}M  eq.epochs={equiv_epochs:4.1f}  loss={v:.4f}")
     del m, o
     if device == "cuda": torch.cuda.empty_cache()
 
@@ -3018,7 +3103,7 @@ instinct, which is the skill this stage exists to build.
 **Verify.** The held-out prediction should land within a few percent. Check that
 the printed token counts really do scale with `N` — if they are all equal, the
 compute-matching broke and the fit is measuring convergence, not scale. Check the
-`epochs` column too: at 20 tokens/param the 22M model needs ~450M tokens, which
+`eq.epochs` column too: at 20 tokens/param the 22M model needs ~450M tokens, which
 is 5+ passes over the `small` corpus. If any size warns, raise `n_docs` toward
 the full TinyStories train split (~2.1M stories) before running this stage —
 otherwise the held-out point is exactly the one damaged by repetition.
@@ -3030,8 +3115,8 @@ otherwise the held-out point is exactly the one damaged by repetition.
 models are systematically under-trained and `alpha` comes out too small. Fitting
 3 parameters to 5 points and treating the result as confirmed — with two degrees
 of freedom, a good prediction is weak evidence. Letting the largest sizes run past
-~4 epochs, so repeated data bends the curve upward at the one point you are
-trying to predict. Reusing a learning rate tuned at
+~4 equivalent epochs, so repeated data bends the curve upward at the one point
+you are trying to predict. Reusing a learning rate tuned at
 one width across all widths, which biases the largest models
 ([Part 7.5](#75-hyperparameter-transfer)).
 
