@@ -2747,8 +2747,13 @@ start_step = 0
 # --- resume, if a checkpoint is already on disk ---
 resume_path = f"{cfg.out_dir}/last.pt"
 if os.path.exists(resume_path):
-    model, optimizer, start_step, cfg, hist = load_ckpt(resume_path, device)  # Stage 12
-    print(f"resumed from step {start_step}")
+    try:
+        model, optimizer, start_step, cfg, hist = load_ckpt(resume_path, device)  # Stage 12
+        print(f"resumed from step {start_step}")
+    except ValueError as e:      # stale checkpoint from an older tokenizer/data build
+        print(f"NOT resuming: {e}")
+        os.replace(resume_path, resume_path + ".stale")
+if start_step > 0:
     # cfg and model were REPLACED by the checkpoint's: recompute everything derived
     # from them, so nothing above silently describes the pre-resume configuration.
     N = getattr(model, "_orig_mod", model).n_params()
@@ -2879,6 +2884,15 @@ Stage 11, which calls them. `12b` verifies the round trip and runs after trainin
 # Cell 12a — checkpoint helpers  (PLACE THIS ABOVE STAGE 11)
 # Both functions use the global `scaler`, which Stage 11 creates before it first
 # calls either one.
+import hashlib
+def data_fingerprint():
+    """Identifies the tokenizer + token files a checkpoint was trained against. Weights
+    only mean something for the exact token ids they were trained on: a checkpoint from
+    an older tokenizer would load fine, then score garbage (val loss ~ln(vocab))."""
+    h = hashlib.sha256(open(f"{cfg.data_dir}/tokenizer.json", "rb").read())
+    h.update(open(f"{cfg.data_dir}/train_meta.json", "rb").read())
+    return h.hexdigest()[:16]
+
 def save_ckpt(model, optimizer, step, cfg, hist, path):
     raw = getattr(model, "_orig_mod", model)        # unwrap torch.compile
     tmp = path + ".tmp"
@@ -2886,6 +2900,7 @@ def save_ckpt(model, optimizer, step, cfg, hist, path):
                 "optimizer": optimizer.state_dict(),
                 "step": step,              # NEXT step to run -> reconstructs data order
                 "cfg": asdict(cfg),
+                "data_fp": data_fingerprint(),   # refuse to resume on different data
                 "hist": hist,
                 "scaler": scaler.state_dict(),       # fp16 loss scale ({} if bf16)
                 # Both RNGs: harmless today (no dropout; the loader is keyed on
@@ -2902,6 +2917,9 @@ def load_ckpt(path, device):
     # weights_only=False unpickles arbitrary Python objects (needed for cfg/hist),
     # which can execute code. Only load checkpoints you created or trust.
     ck = torch.load(path, map_location=device, weights_only=False)
+    if ck.get("data_fp") != data_fingerprint():
+        raise ValueError(f"{path} was trained on a different tokenizer/data "
+                         "(fingerprint mismatch); delete it or rebuild the data")
     c = Config(**ck["cfg"])
     m = GPT(c).to(device); m.load_state_dict(ck["model"])
     o = make_optimizer(m, c); o.load_state_dict(ck["optimizer"])
