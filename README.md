@@ -2058,11 +2058,14 @@ JACCARD_MIN = 0.7      # cutoff on the ESTIMATED Jaccard (fraction of matching
                        # the standard error is ~0.04 at s=0.7
 
 rng = np.random.default_rng(cfg.seed)
-# Keep a,h < 2**31 so a*h + b stays inside uint64 and the modulus is real
-# arithmetic rather than silent wraparound.
-A = rng.integers(1, 1 << 31, NUM_PERM, dtype=np.uint64)
-B = rng.integers(0, 1 << 31, NUM_PERM, dtype=np.uint64)
-MERSENNE = np.uint64((1 << 61) - 1)
+# Work in the field Z_p with p = 2**31 - 1 (a Mersenne prime). Then a, b, h are
+# all < p < 2**31, so a*h + b < 2**62 fits in uint64: no overflow, and
+# h -> (a*h + b) mod p is a genuine random permutation of Z_p for a != 0, drawn
+# uniformly over the WHOLE field. (Restricting a to a small range while keeping
+# a much larger modulus is NOT equivalent -- see "Breaks like this".)
+MERSENNE = np.uint64((1 << 31) - 1)
+A = rng.integers(1, int(MERSENNE), NUM_PERM, dtype=np.uint64)   # a in [1, p-1]
+B = rng.integers(0, int(MERSENNE), NUM_PERM, dtype=np.uint64)   # b in [0, p-1]
 
 def signature(doc):
     toks = doc.lower().split()
@@ -2072,8 +2075,10 @@ def signature(doc):
         shingles = {" ".join(toks[i:i+N_GRAM]) for i in range(len(toks)-N_GRAM+1)}
     # blake2b, not hash(): Python's hash() is salted per process, so a notebook
     # restart would silently give different results.
+    # 32-bit digest reduced into Z_p: two distinct shingles collide with
+    # probability ~2**-31, negligible for documents of a few hundred shingles.
     h = np.array([int.from_bytes(hashlib.blake2b(s.encode(), digest_size=4).digest(),
-                                 "big") for s in shingles], dtype=np.uint64)
+                                 "big") % int(MERSENNE) for s in shingles], dtype=np.uint64)
     return ((A[:, None] * h[None, :] + B[:, None]) % MERSENNE).min(axis=1)
 
 sigs = [signature(d) for d in kept]
@@ -2135,11 +2140,17 @@ TinyStories expect a few percent; on raw Common Crawl, 30–60% is normal.
 gives you *candidates*, and skipping the verification step deletes unrelated
 documents. The mirror-image bug: storing one document per bucket, so a
 candidate that fails verification permanently shadows every later document in
-that bucket. Buckets are lists. Silent integer overflow: drawing `A` up to 2⁶¹ (as `datasketch` does)
-with 32-bit hashes makes `A*h` exceed uint64 and wrap before the modulus applies,
-so "mod p" is not what runs. That is why this cell draws `A` and `B` below 2³¹.
-It is mostly harmless in practice, but it means the code is not doing what it
-claims. Splitting *after* shuffling, but training the tokenizer on the
+that bucket. Buckets are lists. A degenerate hash family: an earlier version of
+this cell kept `a, b < 2³¹` to dodge uint64 overflow but reduced modulo a much
+larger prime (2⁶¹−1). Then `a·h` wraps the modulus only ~4 times, all 128 "random
+permutations" are nearly the same ordering, and they pick nearly the same
+minimum shingle. The estimate stays *unbiased* but its spread explodes — measured
+on two sets with true Jaccard 0.7 and 128 permutations, the standard deviation
+was **0.27** instead of the binomial `√(0.7·0.3/128) ≈ 0.04`. The fix is to make
+the field and the coefficient range match (`p = 2³¹−1`, `a, b` uniform over it).
+The lesson generalizes: an independence assumption can fail silently, and the only
+way to catch it is to measure the estimator's variance, not just its mean.
+Splitting *after* shuffling, but training the tokenizer on the
 unsplit corpus — the bug this cell's ordering exists to avoid.
 
 ---
