@@ -751,7 +751,9 @@ bits per byte               1.5 / (ln 2 × 4.2)    = 0.515
 A perplexity of 4.48 is the *effective branching factor* under the cross-entropy
 measure — down from 16,000 at initialization — not a claim that the model's
 actual next-token distribution is uniform over ~4.5 tokens; in reality it is
-peaked, and 4.48 is `e` to the power of its average entropy. Now a second model
+peaked, and 4.48 is `e` raised to the model's average next-token negative
+log-likelihood on this evaluation text (a cross-entropy, not the entropy of its
+predictive distribution). Now a second model
 with a 32k vocabulary averages 5 bytes/token and reports a *higher* 1.7
 nats/token. Its BPB is `1.7 / (ln 2 × 5) = 0.49` — lower than the first model's
 0.515, on this text. Raw loss would have ranked the two models the wrong way
@@ -929,8 +931,9 @@ in 8.
 
 - Normal with `std ≈ 0.02`, or `1/√d_model`.
 - Scale residual-output projections (attention out-proj, MLP down-proj) by
-  `1/√(2·n_layers)`. This keeps the variance of the residual stream from growing
-  with depth and is the difference between a stable and an unstable deep model.
+  `1/√(2·n_layers)`. This helps keep the variance of the residual stream from growing
+  with depth, and can matter a great deal for stable optimization of deep models
+  (alongside normalization, the LR schedule and the optimizer, as in Part 5.1).
 - Embeddings: same small normal init.
 
 ### 7.5 Hyperparameter transfer
@@ -2407,7 +2410,8 @@ def apply_rope(x, cos, sin):
 class Attention(nn.Module):
     def __init__(self, c):
         super().__init__()
-        assert c.n_head % c.n_kv_head == 0
+        assert c.d_model % c.n_head == 0, "d_model must be divisible by n_head"
+        assert c.n_head % c.n_kv_head == 0, "n_head must be divisible by n_kv_head"
         self.nh, self.nkv = c.n_head, c.n_kv_head
         self.hd = c.d_model // c.n_head
         self.rep = self.nh // self.nkv
@@ -2997,8 +3001,9 @@ def evaluate_corpus(model, data, T, bs=4):
 nll, n_eval = evaluate_corpus(model, val_loader.data, cfg.seq_len)
 # Every content token is scored except the file's very first (no context to
 # predict it from), so n_eval should equal n_content_tokens - 1. Its bytes are
-# still in n_bytes, so BPB differs from exact corpus BPB by one token's worth --
-# negligible for any real validation set.
+# still in n_bytes. So the reported BPB is a fixed-block APPROXIMATION to exact
+# corpus BPB: one initial content token has no causal context, so it contributes
+# bytes but no NLL. The discrepancy is negligible for a nontrivial validation set.
 expected = val_meta["n_content_tokens"] - 1      # exactly one token is unscored
 assert n_eval == expected, (n_eval, expected, val_meta)
 val_loss = nll / n_eval                              # nats per content token
@@ -3187,11 +3192,16 @@ one size reproduces it.
 # Cell 15 — mini scaling law
 from scipy.optimize import curve_fit
 
-# Each model trains to the SAME tokens-per-parameter ratio, so every point is at
-# comparable convergence. Training all sizes for a fixed number of steps would
-# give them equal tokens, leaving the largest the most under-trained -- which
-# bends the curve and is the usual reason a notebook scaling fit "fails".
-TOK_PER_PARAM = 20                     # Chinchilla-ish [Part 8.2]
+# Each model trains to the SAME tokens-per-parameter ratio. That avoids the
+# obvious bias of giving every size the same token count (which leaves the
+# largest the most under-trained and is the usual reason a notebook scaling fit
+# "fails"), but it is a controlled sweep, NOT a guarantee that every model is
+# equally converged: the best ratio depends on the recipe, and 20 is only a rule
+# of thumb [Part 8.2].
+# Also not perfectly controlled: depth changes with width, and d=320 falls back
+# to MQA (5 heads cannot share 2 KV heads). Treat the fitted exponent as
+# illustrative, not an architecture-independent estimate of alpha.
+TOK_PER_PARAM = 20
 
 SIZES = [(128, 4), (192, 6), (256, 6), (320, 8), (384, 8), (512, 8)]
 train_tokens = json.load(open(f"{cfg.data_dir}/train_meta.json"))["n_tokens"]
