@@ -712,8 +712,10 @@ prefix, never on its own samples. This creates train/inference mismatch
 | Perplexity | `exp(loss)` | Intuition; "effective branching factor" |
 | Bits per byte (BPB) | `loss · n_tokens / (ln2 · n_bytes)` | **Comparing across tokenizers** |
 
-> Always compare models with BPB, never raw loss, unless the tokenizers are
-> identical. A bigger vocabulary packs more text into each token, so per-token
+> When comparing language-model likelihood across different tokenizers on the
+> same underlying text, use BPB rather than raw per-token loss. (It is the right
+> tool for that one job; downstream accuracy, calibration or latency need their
+> own metrics.) A bigger vocabulary packs more text into each token, so per-token
 > loss is mechanically higher even when the model is equally good or better on
 > the same underlying text. BPB removes that artifact.
 
@@ -2968,6 +2970,8 @@ def evaluate_corpus(model, data, T, bs=4):
     from tokens 512..699, not from 0..699. That is the standard fixed-block
     convention; it slightly overestimates the loss compared with sliding-window
     evaluation (stride < T, scoring only the new targets), which is costlier.
+    The split is scored as ONE concatenated, EOT-separated stream (see the note
+    after the call below).
     Returns (sum of NLL in nats over CONTENT targets, number of such targets).
     Targets equal to EOT are masked out: the injected separators have no bytes,
     so their loss must not enter a bits-per-BYTE numerator. (`estimate_loss`
@@ -3002,11 +3006,12 @@ def evaluate_corpus(model, data, T, bs=4):
     return nll, cnt
 
 nll, n_eval = evaluate_corpus(model, val_loader.data, cfg.seq_len)
-# Every content token is scored except the file's very first (no context to
-# predict it from), so n_eval should equal n_content_tokens - 1. Its bytes are
-# still in n_bytes. So the reported BPB is a fixed-block APPROXIMATION to exact
-# corpus BPB: one initial content token has no causal context, so it contributes
-# bytes but no NLL. The discrepancy is negligible for a nontrivial validation set.
+# The validation split is scored as ONE concatenated, EOT-separated stream. EOT
+# targets are excluded from the NLL, but an EOT can still be in the context when
+# the first token of the next document is predicted. Only the very first token of
+# the stream has no predecessor, so it cannot be scored causally: n_eval must equal
+# n_content_tokens - 1. Its NLL is absent while n_bytes covers the whole corpus --
+# a boundary effect that is negligible for a nontrivial validation corpus.
 expected = val_meta["n_content_tokens"] - 1      # exactly one token is unscored
 assert n_eval == expected, (n_eval, expected, val_meta)
 val_loss = nll / n_eval                              # nats per content token
@@ -3239,7 +3244,14 @@ for d, L in SIZES:
     # Fixed tokens-per-parameter budget: D = TOK_PER_PARAM * N. NOT compute-matched --
     # compute is ~6ND = 6*TOK_PER_PARAM*N^2, so a model with 2x the parameters gets
     # ~4x the compute (that is the point of a Chinchilla-style D/N sweep).
-    c.max_steps = max(200, round(TOK_PER_PARAM * n / tps))
+    c.max_steps = max(1, round(TOK_PER_PARAM * n / tps))
+    # No floor on the step count: a floor (e.g. max(200, ...)) would give the
+    # smallest models MORE tokens per parameter than the rest and break the very
+    # D/N control this sweep exists to demonstrate. Steps are integers, so the
+    # achieved ratio is only approximate -- measure it and check it.
+    achieved_tpp = c.max_steps * tps / n
+    assert abs(achieved_tpp / TOK_PER_PARAM - 1) < 0.10, \
+        f"d={d}: {achieved_tpp:.1f} tokens/param vs target {TOK_PER_PARAM}; raise the token budget or batch size"
     equiv_epochs = c.max_steps * tps / train_tokens   # equivalent, not literal --
                                                        # see Stage 6's comment
     if equiv_epochs > 4:  # [Part 3.5] -- repeated data, not model size, will set this loss
@@ -3264,7 +3276,8 @@ for d, L in SIZES:
     v = estimate_loss(m, val_loader, 30)
     results.append((n, v))
     print(f"N={n/1e6:6.2f}M  steps={c.max_steps:5d}  "
-          f"tokens={c.max_steps*tps/1e6:7.1f}M  eq.epochs={equiv_epochs:4.1f}  loss={v:.4f}")
+          f"tokens={c.max_steps*tps/1e6:7.1f}M  tok/param={achieved_tpp:5.2f}  "
+          f"eq.epochs={equiv_epochs:4.1f}  loss={v:.4f}")
     del m, o
     if device == "cuda": torch.cuda.empty_cache()
 
@@ -3292,7 +3305,7 @@ instinct, which is the skill this stage exists to build.
 
 **Verify.** The held-out prediction should land within a few percent. Check that
 the printed token counts really do scale with `N` — if they are all equal, the
-the token budget broke and the fit is measuring convergence, not scale. Check the
+token budget broke and the fit is measuring convergence, not scale. Check the
 `eq.epochs` column too: at 20 tokens/param the 22M model needs ~450M tokens, which
 is 5+ passes over the `small` corpus. If any size warns, raise `n_docs` toward
 the full TinyStories train split (~2.1M stories) before running this stage —
