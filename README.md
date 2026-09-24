@@ -1968,7 +1968,7 @@ print(f"{len(docs):,} docs, {sum(len(d) for d in docs)/1e6:.1f}M chars")
 # exposed it (the rejected documents were full of it). Repair it here, before
 # anything filters or tokenizes -- otherwise the tokenizer spends merges on it.
 # ftfy.fix_text also uncurls quotes, which is what Stage 3's punctuation rule expects.
-import ftfy
+import ftfy, re
 n_fixed = 0
 for i, d in enumerate(docs):
     fixed = ftfy.fix_text(d)
@@ -1978,6 +1978,10 @@ for i, d in enumerate(docs):
     # it after ftfy, and those lines then end in a non-punctuation character, so
     # Stage 3 still dropped 201 documents. The residue is a closing double quote.
     fixed = fixed.replace("â€", '"')
+    # A literal "<|endoftext|>" in the text would be encoded AS the separator id
+    # (HF tokenizers match special tokens inside raw input), faking a document
+    # boundary mid-document. Absent from TinyStories; common in web text about LLMs.
+    fixed = re.sub(r"<\|(?:endoftext|reserved_\d+)\|>", "", fixed)
     n_fixed += (fixed != d)
     docs[i] = fixed
 print(f"repaired text in {n_fixed:,} / {len(docs):,} docs")
@@ -2060,7 +2064,9 @@ for fired, d in random.sample(removed, min(5, len(removed))):
     print(f"\n--- dropped by {', '.join(fired)} ---\n{d[:300]}")
 ```
 
-**Verify.** Keep rate should be 50–90% on clean data, 10–40% on raw web. Then
+**Verify.** Keep rate depends on the source: TinyStories is synthetic and already clean, so
+expect ~99% once Stage 2's repair has run (a real `tiny` run kept 19,965 of
+20,000); on raw web text the same kind of rules keep roughly 10–40%. Then
 read five rejected documents. If any look like text you'd want the model to
 learn, loosen that rule.
 
@@ -2316,7 +2322,9 @@ print(f"\ntraining exposure: {equiv_epochs:.2f} equivalent token epochs")
 
 **Verify.** Decode the first 200 tokens of `train.bin` (using `token_dtype`, not
 a hardcoded `np.uint16`) and confirm it reads as text with `<|endoftext|>` at
-document boundaries. Check `equiv_epochs`: more than ~4 gives diminishing
+document boundaries. The separator count must equal the number of train
+documents: more means a literal `<|endoftext|>` in the text was encoded as the
+separator (Stage 2 strips those). Check `equiv_epochs`: more than ~4 gives diminishing
 returns ([Part 3.5](#35-mixing)) — get more data or fewer steps.
 
 **Breaks like this.** Hardcoding `np.uint16` for both writing and reading, so a
@@ -2748,12 +2756,14 @@ start_step = 0
 resume_path = f"{cfg.out_dir}/last.pt"
 if os.path.exists(resume_path):
     try:
-        m_, o_, s_, c_, h_ = load_ckpt(resume_path, device)  # Stage 12
-        # The loaders were built from the CURRENT cfg; the checkpoint brings its own.
-        if (train_loader.B, train_loader.T) != (c_.batch_size, c_.seq_len):
-            raise ValueError(f"loader is B={train_loader.B},T={train_loader.T} but the "
-                             f"checkpoint used B={c_.batch_size},T={c_.seq_len}")
-        model, optimizer, start_step, cfg, hist = m_, o_, s_, c_, h_
+        # Passing train_loader makes load_ckpt refuse a batch/seq_len mismatch before
+        # it touches the scaler or RNG, so a refused checkpoint leaves no trace.
+        model, optimizer, start_step, c_, hist = load_ckpt(resume_path, device,
+                                                           train_loader)  # Stage 12
+        # Keep THIS session's paths: the checkpoint's cfg remembers where it was
+        # saved, which is stale if ROOT changed (USE_DRIVE toggled, files copied).
+        c_.data_dir, c_.out_dir = cfg.data_dir, cfg.out_dir
+        cfg = c_
         print(f"resumed from step {start_step}")
     except ValueError as e:      # stale checkpoint from an older tokenizer/data build
         print(f"NOT resuming: {e}")
@@ -2918,7 +2928,7 @@ def save_ckpt(model, optimizer, step, cfg, hist, path):
     os.replace(tmp, path)     # atomic: a crash mid-write can't corrupt the file
     print(f"saved {path} @ step {step}")
 
-def load_ckpt(path, device):
+def load_ckpt(path, device, loader=None):
     # weights_only=False unpickles arbitrary Python objects (needed for cfg/hist),
     # which can execute code. Only load checkpoints you created or trust.
     ck = torch.load(path, map_location=device, weights_only=False)
@@ -2926,6 +2936,12 @@ def load_ckpt(path, device):
         raise ValueError(f"{path} was trained on a different tokenizer/data "
                          "(fingerprint mismatch); delete it or rebuild the data")
     c = Config(**ck["cfg"])
+    # The loaders were built from the session's cfg. A checkpoint with a different
+    # batch_size or seq_len would resume on a different data order; refuse it HERE,
+    # before anything below overwrites the scaler or the RNG.
+    if loader is not None and (loader.B, loader.T) != (c.batch_size, c.seq_len):
+        raise ValueError(f"{path} used B={c.batch_size},T={c.seq_len} but the "
+                         f"loader is B={loader.B},T={loader.T}")
     m = GPT(c).to(device); m.load_state_dict(ck["model"])
     o = make_optimizer(m, c); o.load_state_dict(ck["optimizer"])
     if ck.get("scaler"):             # else fp16 restarts at 65536 and re-backs-off
@@ -3075,12 +3091,15 @@ print(f"val loss {val_loss:.4f} | ppl {math.exp(val_loss):.2f} | BPB {bpb:.4f}")
 
 @torch.no_grad()
 def generate(model, prompt, max_new=120, temp=0.8, top_k=50):
-    was_training = model.training
-    model.eval()
+    # Sample with the uncompiled module: the prompt grows by one token per step,
+    # which would make torch.compile recompile repeatedly.
+    net = getattr(model, "_orig_mod", model)
+    was_training = net.training
+    net.eval()
     ids = torch.tensor([tok.encode(prompt).ids], device=device)
     for _ in range(max_new):
         window = ids[:, -cfg.seq_len:]
-        with autocast: logits, _ = model(window)
+        with autocast: logits, _ = net(window)
         logits = logits[:, -1, :].float() / temp
         if top_k:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -3088,7 +3107,7 @@ def generate(model, prompt, max_new=120, temp=0.8, top_k=50):
         nxt = torch.multinomial(F.softmax(logits, -1), 1)
         if nxt.item() == EOT: break
         ids = torch.cat([ids, nxt], dim=1)
-    model.train(was_training)                        # restore, don't force train mode
+    net.train(was_training)                          # restore, don't force train mode
     return tok.decode(ids[0].tolist())
 
 for p in ["Once upon a time", "The little robot"]:
